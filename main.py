@@ -5,27 +5,21 @@ import io
 import time
 import logging
 from dotenv import load_dotenv
-from discord import Client, Intents, Interaction, File, app_commands, Attachment, ButtonStyle, ui, Embed, Color, SelectOption
+from discord import Client, Intents, Interaction, app_commands, Attachment, ButtonStyle, ui, Embed, Color
 from discord.ext import commands
 import google.genai as genai
 import google.genai.types as types
-import requests
 from bs4 import BeautifulSoup
 import aiohttp
-from typing import Optional, Dict, List, Tuple, Union
+from typing import Optional, Dict, List, Tuple
 import re
-import json
-from discord.ui import Select
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-required_env_vars = [
-    'GEMINI_API_KEY', 'DISCORD_TOKEN', 'GOOGLE_API_KEY', 'GOOGLE_CSE_ID',
-    'WEATHERAPI_KEY', 'NEWSAPI_KEY'
-]
+required_env_vars = ['GEMINI_API_KEY', 'DISCORD_TOKEN', 'GOOGLE_API_KEY', 'GOOGLE_CSE_ID']
 missing_vars = [var for var in required_env_vars if not os.getenv(var)]
 if missing_vars:
     logger.error(f"Missing environment variables: {', '.join(missing_vars)}")
@@ -34,8 +28,6 @@ if missing_vars:
 client = genai.Client(api_key=os.getenv('GEMINI_API_KEY'))
 GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
 GOOGLE_CSE_ID = os.getenv('GOOGLE_CSE_ID')
-WEATHERAPI_KEY = os.getenv('WEATHERAPI_KEY')
-NEWSAPI_KEY = os.getenv('NEWSAPI_KEY')
 
 system_prompt = """
 Jawab dengan bahasa Indonesia. Pastikan output rapi dan mudah dibaca di Discord menggunakan format Markdown:
@@ -67,7 +59,6 @@ class BotState:
 
 bot_state = BotState()
 
-MAX_HISTORY = 10
 COOLDOWN_TIME = 30
 MAX_FILE_SIZE = 25 * 1024 * 1024
 INACTIVITY_TIMEOUT = 600
@@ -115,22 +106,6 @@ async def fetch_web_content(url: str) -> str:
     except Exception as error:
         logger.error(f'Error di fetchWebContent: {error}')
         return f"**Error Scraping**\nGagal mengambil konten dari {url}: {str(error)}"
-
-async def translate_text(text: str, target_language: str = 'en') -> str:
-    try:
-        session = await get_http_session()
-        url = f"https://translation.googleapis.com/language/translate/v2?key={GOOGLE_API_KEY}"
-        payload = {'q': text, 'target': target_language, 'format': 'text'}
-        async with session.post(url, json=payload) as response:
-            if response.status != 200:
-                logger.error(f'Translation API error: {response.status}')
-                return text
-            result = await response.json()
-            translated_text = result['data']['translations'][0]['translatedText']
-            return translated_text
-    except Exception as error:
-        logger.error(f'Error di translateText: {error}')
-        return text
 
 async def google_search(query: str) -> str:
     try:
@@ -192,45 +167,37 @@ async def generate_response(channel_id: str, prompt: str, media_data: Optional[D
             search_results = await google_search(search_query)
             contents.append(search_results)
         if media_data:
-            try:
-                if media_data['mime_type'] == 'application/pdf':
-                    pdf_buffer = base64.b64decode(media_data['base64'])
-                    if len(pdf_buffer) > MAX_FILE_SIZE:
-                        return "**Error**\nFile PDF terlalu besar. Maksimal 25MB."
-                    pdf_file = client.files.upload(
-                        file=io.BytesIO(pdf_buffer),
-                        config=dict(mime_type='application/pdf'))
-                    contents.append(pdf_file)
-                else:
-                    file_data = base64.b64decode(media_data['base64'])
-                    if len(file_data) > MAX_FILE_SIZE:
-                        return "**Error**\nFile terlalu besar. Maksimal 25MB."
-                    contents.append(
-                        types.Part.from_bytes(
-                            data=file_data, mime_type=media_data['mime_type']))
-            except Exception as e:
-                logger.error(f'Error processing media: {e}')
-                return "**Error**\nGagal memproses file media."
+            if media_data['mime_type'] == 'application/pdf':
+                pdf_buffer = base64.b64decode(media_data['base64'])
+                if len(pdf_buffer) > MAX_FILE_SIZE:
+                    return "**Error**\nFile PDF terlalu besar. Maksimal 25MB."
+                pdf_file = client.files.upload(
+                    file=io.BytesIO(pdf_buffer),
+                    config=dict(mime_type='application/pdf'))
+                contents.append(pdf_file)
+            else:
+                file_data = base64.b64decode(media_data['base64'])
+                if len(file_data) > MAX_FILE_SIZE:
+                    return "**Error**\nFile terlalu besar. Maksimal 25MB."
+                contents.append(
+                    types.Part.from_bytes(
+                        data=file_data, mime_type=media_data['mime_type']))
         if youtube_url:
             contents.append(
                 types.Part(file_data=types.FileData(file_uri=youtube_url)))
         if tenor_url:
             contents.append(tenor_url)
-        try:
-            # MODIFIED: Fixed syntax error by removing .rotate and ensuring proper closing
-            response = await asyncio.wait_for(
-                asyncio.get_event_loop().run_in_executor(
-                    None, lambda: chat.send_message(contents)),
-                timeout=60.0)  # Changed .rotate to correct timeout value
-        except asyncio.TimeoutError:
-            return "**Error**\nTimeout: Permintaan memakan waktu terlalu lama."
+        # Perubahan: Menghapus 'await' dan 'asyncio.wait_for' karena chat.send_message adalah synchronous
+        # Menjalankan chat.send_message di thread executor untuk menghindari blocking
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(None, lambda: chat.send_message(contents))
         response_text = response.text
         if not any(marker in response_text for marker in ['#', '-', '```']):
-            paragraphs = [
-                p.strip() for p in response_text.split('\n\n') if p.strip()
-            ]
+            paragraphs = [p.strip() for p in response_text.split('\n\n') if p.strip()]
             response_text = '\n\n' + '\n\n'.join(paragraphs)
         return response_text
+    except asyncio.TimeoutError:
+        return "**Error**\nTimeout: Permintaan memakan waktu terlalu lama."
     except Exception as error:
         logger.error(f'Error di generateResponse: {error}')
         return f"**Error**\nTerjadi kesalahan saat menghasilkan respons: {str(error)}"
@@ -330,83 +297,6 @@ class InteractionButtons(ui.View):
             color=Color.blurple())
         await interaction.response.send_message(embed=embed)
 
-class CitySelect(ui.Select):
-    def __init__(self):
-        options = [
-            SelectOption(label="Jakarta", value="Jakarta"),
-            SelectOption(label="Bandung", value="Bandung"),
-            SelectOption(label="Surabaya", value="Surabaya"),
-            SelectOption(label="Yogyakarta", value="Yogyakarta"),
-            SelectOption(label="Medan", value="Medan"),
-            SelectOption(label="Denpasar", value="Denpasar"),
-            SelectOption(label="Makassar", value="Makassar"),
-            SelectOption(label="Semarang", value="Semarang"),
-            SelectOption(label="Palembang", value="Palembang"),
-            SelectOption(label="Manado", value="Manado")
-        ]
-        super().__init__(placeholder="Pilih kota untuk melihat cuaca...", options=options, min_values=1, max_values=1)
-
-    async def callback(self, interaction: Interaction):
-        city = self.values[0]
-        try:
-            session = await get_http_session()
-            url = f"http://api.weatherapi.com/v1/current.json?key={WEATHERAPI_KEY}&q={city},Indonesia&aqi=no"
-            async with session.get(url) as response:
-                if response.status != 200:
-                    await interaction.response.send_message(f"**Error**\nGagal mengambil data cuaca untuk {city}.", ephemeral=True)
-                    return
-                data = await response.json()
-            
-            temp = data['current']['temp_c']
-            feels_like = data['current']['feelslike_c']
-            weather_desc = data['current']['condition']['text']
-            humidity = data['current']['humidity']
-            wind_speed = data['current']['wind_kph'] / 3.6
-
-            embed = Embed(title=f"Cuaca di {city}, Indonesia", color=Color.blue())
-            embed.add_field(name="Suhu", value=f"{temp}°C", inline=True)
-            embed.add_field(name="Terasa Seperti", value=f"{feels_like}°C", inline=True)
-            embed.add_field(name="Deskripsi", value=weather_desc.capitalize(), inline=True)
-            embed.add_field(name="Kelembapan", value=f"{humidity}%", inline=True)
-            embed.add_field(name="Kecepatan Angin", value=f"{wind_speed:.1f} m/s", inline=True)
-            embed.set_footer(text="Data dari WeatherAPI.com")
-
-            await interaction.response.send_message(embed=embed)
-        except Exception as e:
-            logger.error(f"Error fetching weather data: {e}")
-            await interaction.response.send_message(f"**Error**\nTerjadi kesalahan saat mengambil data cuaca: {str(e)}", ephemeral=True)
-
-class CitySelectView(ui.View):
-    def __init__(self):
-        super().__init__(timeout=60)
-        self.add_item(CitySelect())
-
-async def fetch_viral_news() -> str:
-    try:
-        session = await get_http_session()
-        url = f"https://newsapi.org/v2/top-headlines?country=id&apiKey={NEWSAPI_KEY}&pageSize=5"
-        async with session.get(url) as response:
-            if response.status != 200:
-                return f"**Error**\nGagal mengambil berita: HTTP {response.status}"
-            data = await response.json()
-        
-        if not data.get('articles'):
-            return "**Berita Viral**\nMaaf, tidak ada berita yang tersedia saat ini."
-        
-        news_results = "**5 Berita Viral di Indonesia**\n\n"
-        for index, article in enumerate(data['articles']):
-            title = article.get('title', 'No Title')[:100]
-            description = article.get('description', 'No description')[:200] or 'Tidak ada deskripsi'
-            url = article.get('url', '#')
-            news_results += f"- **{index + 1}. {title}**\n"
-            news_results += f"  {description}\n"
-            news_results += f"  Sumber: [Klik di sini]({url})\n\n"
-        
-        return news_results
-    except Exception as error:
-        logger.error(f'Error fetching news: {error}')
-        return f"**Error**\nTerjadi kesalahan saat mengambil berita: {str(error)}"
-
 intents = Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
@@ -424,35 +314,29 @@ async def on_ready():
 
 async def check_inactivity():
     while True:
-        try:
-            await asyncio.sleep(5)
-            current_time = time.time()
-            for channel_id in bot_state.channel_activity:
-                if bot_state.channel_activity.get(channel_id, False):
-                    last_activity = bot_state.last_activity.get(channel_id, 0)
-                    if current_time - last_activity > INACTIVITY_TIMEOUT:
-                        if channel_id not in bot_state.last_button_message:
-                            channel = bot.get_channel(int(channel_id))
-                            if channel:
-                                embed = Embed(
-                                    title="Bot Tidak Aktif",
-                                    description="Bot telah tidak aktif selama 10 menit. Pilih opsi di bawah untuk melanjutkan:",
-                                    color=Color.blue())
-                                view = InteractionButtons(channel_id)
-                                message = await channel.send(embed=embed, view=view)
-                                bot_state.last_button_message[channel_id] = message
-        except Exception as e:
-            logger.error(f"Error in check_inactivity: {e}")
+        await asyncio.sleep(5)
+        current_time = time.time()
+        for channel_id in list(bot_state.channel_activity):
+            if bot_state.channel_activity.get(channel_id, False):
+                last_activity = bot_state.last_activity.get(channel_id, 0)
+                if current_time - last_activity > INACTIVITY_TIMEOUT:
+                    if channel_id not in bot_state.last_button_message:
+                        channel = bot.get_channel(int(channel_id))
+                        if channel:
+                            embed = Embed(
+                                title="Bot Tidak Aktif",
+                                description="Bot telah tidak aktif selama 10 menit. Pilih opsi di bawah untuk melanjutkan:",
+                                color=Color.blue())
+                            view = InteractionButtons(channel_id)
+                            message = await channel.send(embed=embed, view=view)
+                            bot_state.last_button_message[channel_id] = message
         await asyncio.sleep(5)
 
 async def periodic_cleanup():
     while True:
-        try:
-            await asyncio.sleep(300)
-            bot_state.cleanup_old_data()
-            logger.info("Performed periodic cleanup")
-        except Exception as e:
-            logger.error(f"Error in periodic cleanup: {e}")
+        await asyncio.sleep(300)
+        bot_state.cleanup_old_data()
+        logger.info("Performed periodic cleanup")
 
 @bot.tree.command(name="activate", description="Mengaktifkan bot di channel ini")
 async def activate(interaction: Interaction):
@@ -494,40 +378,6 @@ async def deactivate(interaction: Interaction):
         except Exception as e:
             logger.error(f"Error deleting button message: {e}")
     await interaction.response.send_message("**Status**\nBot dinonaktifkan di channel ini!")
-
-@bot.tree.command(name="cuaca", description="Cek cuaca di kota tertentu di Indonesia")
-async def cuaca(interaction: Interaction):
-    user_id = str(interaction.user.id)
-    on_cooldown, remaining_time = check_cooldown(user_id, "cuaca")
-    if on_cooldown:
-        await interaction.response.send_message(
-            f"**Cooldown**\nSilakan tunggu {remaining_time:.1f} detik sebelum menggunakan perintah ini lagi.",
-            ephemeral=True)
-        return
-    embed = Embed(
-        title="Pilih Kota",
-        description="Gunakan menu di bawah untuk memilih kota di Indonesia.",
-        color=Color.blue()
-    )
-    view = CitySelectView()
-    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-
-@bot.tree.command(name="berita", description="Tampilkan 5 berita viral di Indonesia")
-async def berita(interaction: Interaction):
-    user_id = str(interaction.user.id)
-    on_cooldown, remaining_time = check_cooldown(user_id, "berita")
-    if on_cooldown:
-        await interaction.response.send_message(
-            f"**Cooldown**\nSilakan tunggu {remaining_time:.1f} detik sebelum menggunakan perintah ini lagi.",
-            ephemeral=True)
-        return
-    async with interaction.channel.typing():
-        news_results = await fetch_viral_news()
-        response_chunks = split_text(news_results)
-        for i, chunk in enumerate(response_chunks):
-            await interaction.response.send_message(chunk) if i == 0 else await interaction.channel.send(chunk)
-            if i < len(response_chunks) - 1:
-                await asyncio.sleep(0.5)
 
 async def download_attachment(attachment: Attachment) -> Optional[bytes]:
     try:
@@ -637,34 +487,6 @@ async def on_message(message):
                 logger.error(f'Error in gift command: {e}')
                 await message.channel.send("**Error**\nTerjadi kesalahan saat memproses permintaan.")
         return
-    if content.lower().startswith('!cuaca'):
-        user_id = str(message.author.id)
-        on_cooldown, remaining_time = check_cooldown(user_id, "cuaca")
-        if on_cooldown:
-            await message.reply(f"**Cooldown**\nSilakan tunggu {remaining_time:.1f} detik sebelum menggunakan perintah ini lagi.")
-            return
-        embed = Embed(
-            title="Pilih Kota",
-            description="Gunakan menu di bawah untuk memilih kota di Indonesia.",
-            color=Color.blue()
-        )
-        view = CitySelectView()
-        await message.reply(embed=embed, view=view, ephemeral=True)
-        return
-    if content.lower().startswith('!berita'):
-        user_id = str(message.author.id)
-        on_cooldown, remaining_time = check_cooldown(user_id, "berita")
-        if on_cooldown:
-            await message.reply(f"**Cooldown**\nSilakan tunggu {remaining_time:.1f} detik sebelum menggunakan perintah ini lagi.")
-            return
-        async with message.channel.typing():
-            news_results = await fetch_viral_news()
-            response_chunks = split_text(news_results)
-            for i, chunk in enumerate(response_chunks):
-                await message.reply(chunk) if i == 0 else await message.channel.send(chunk)
-                if i < len(response_chunks) - 1:
-                    await asyncio.sleep(0.5)
-        return
     if is_bot_active or content.startswith('!chat') or content.startswith('!cari'):
         prompt = content
         search_query = None
@@ -682,8 +504,6 @@ async def on_message(message):
                 await message.reply('**Error**\nGunakan format: `!chat [pertanyaan atau pesan]`')
                 return
             prompt = chat_prompt
-        elif is_bot_active and not content.startswith('!'):
-            prompt = content
         attachment = message.attachments[0] if message.attachments else None
         media_data = None
         if attachment:
