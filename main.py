@@ -5,7 +5,7 @@ import io
 import time
 import logging
 from dotenv import load_dotenv
-from discord import Client, Intents, Interaction, app_commands, Attachment, ButtonStyle, ui, Embed, Color
+from discord import Client, Intents, Interaction, app_commands, Attachment, ButtonStyle, ui, Embed, Color, File
 from discord.ext import commands
 import google.genai as genai
 import google.genai.types as types
@@ -14,6 +14,7 @@ from bs4 import BeautifulSoup
 import aiohttp
 from typing import Optional, Dict, List, Tuple
 import re
+import wave
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -226,6 +227,62 @@ async def generate_response(channel_id: str, prompt: str, media_data: Optional[D
         logger.error(f'Error di generateResponse: {error}')
         return f"**Error**\nTerjadi kesalahan saat menghasilkan respons: {str(error)}"
 
+async def generate_tts_audio(prompt: str, language: str) -> Optional[bytes]:
+    """
+    Generates TTS audio from text prompt using Gemini API.
+    Supports Indonesian (id-ID), English (en-US), and Japanese (ja-JP).
+    """
+    try:
+        language_config = {
+            'id-ID': {'voice_name': 'Puck', 'bcp_code': 'id-ID'},
+            'en-US': {'voice_name': 'Kore', 'bcp_code': 'en-US'},
+            'ja-JP': {'voice_name': 'Leda', 'bcp_code': 'ja-JP'}
+        }
+        
+        if language not in language_config:
+            return None
+            
+        config = language_config[language]
+        voice_name = config['voice_name']
+        
+        response = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: client.models.generate_content(
+                model="gemini-2.5-flash-preview-tts",
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_modalities=["AUDIO"],
+                    speech_config=types.SpeechConfig(
+                        voice_config=types.VoiceConfig(
+                            prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                                voice_name=voice_name
+                            )
+                        )
+                    )
+                )
+            )
+        )
+        
+        audio_data = response.candidates[0].content.parts[0].inline_data.data
+        return audio_data
+        
+    except Exception as e:
+        logger.error(f'Error in generate_tts_audio: {e}')
+        return None
+
+def save_temp_wav(audio_data: bytes) -> str:
+    """
+    Saves audio data to a temporary WAV file.
+    Returns the file path.
+    """
+    temp_file = f"temp_{int(time.time())}.wav"
+    with wave.open(temp_file, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(24000)
+        wf.writeframes(audio_data)
+    return temp_file
+
 def split_text(text: str, max_length: int = 1900) -> List[str]:
     if len(text) <= max_length:
         return [text]
@@ -436,6 +493,36 @@ async def on_message(message):
             del bot_state.last_button_message[channel_id]
         except Exception as e:
             logger.error(f"Error deleting button message: {e}")
+            
+    if content.lower().startswith('!suara'):
+        async with message.channel.typing():
+            tts_prompt = content.replace('!suara', '', 1).strip()
+            if not tts_prompt:
+                await message.reply('**Error**\nGunakan format: `!suara [teks untuk diucapkan]`')
+                return
+                
+            language = 'id-ID'
+            if tts_prompt.lower().startswith('en:'):
+                language = 'en-US'
+                tts_prompt = tts_prompt[3:].strip()
+            elif tts_prompt.lower().startswith('ja:'):
+                language = 'ja-JP'
+                tts_prompt = tts_prompt[3:].strip()
+                
+            audio_data = await generate_tts_audio(tts_prompt, language)
+            if audio_data is None:
+                await message.reply(f'**Error**\nGagal menghasilkan suara untuk bahasa {language}.')
+                return
+                
+            temp_file = save_temp_wav(audio_data)
+            
+            with open(temp_file, 'rb') as f:
+                audio_file = File(f, filename='output.wav')
+                await message.channel.send(file=audio_file)
+                
+            os.remove(temp_file)
+        return
+        
     if content.lower() == '!reset':
         if channel_id in bot_state.conversation_history:
             bot_state.conversation_history.pop(channel_id)
