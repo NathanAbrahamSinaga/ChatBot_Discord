@@ -153,7 +153,7 @@ async def generate_response(channel_id: str, prompt: str, media_data: Optional[D
                            search_query: Optional[str] = None, use_thinking: bool = False,
                            youtube_url: Optional[str] = None, tenor_url: Optional[str] = None) -> str:
     try:
-        model_name = "gemini-2.0-flash-thinking-exp" if use_thinking else "gemini-2.0-flash"
+        model_name = "gemini-2.5-pro" if use_thinking else "gemini-2.5-flash"
         if channel_id not in bot_state.conversation_history:
             bot_state.conversation_history[channel_id] = client.chats.create(
                 model=model_name,
@@ -187,8 +187,6 @@ async def generate_response(channel_id: str, prompt: str, media_data: Optional[D
                 types.Part(file_data=types.FileData(file_uri=youtube_url)))
         if tenor_url:
             contents.append(tenor_url)
-        # Perubahan: Menghapus 'await' dan 'asyncio.wait_for' karena chat.send_message adalah synchronous
-        # Menjalankan chat.send_message di thread executor untuk menghindari blocking
         loop = asyncio.get_event_loop()
         response = await loop.run_in_executor(None, lambda: chat.send_message(contents))
         response_text = response.text
@@ -562,6 +560,7 @@ async def on_error(event, *args, **kwargs):
 
 @bot.event
 async def on_command_error(ctx, error):
+    
     if isinstance(error, commands.CommandOnCooldown):
         await ctx.send(
             f"⏰ Command sedang cooldown. Coba lagi dalam {error.retry_after:.1f} detik.")
