@@ -9,6 +9,7 @@ from discord import Client, Intents, Interaction, app_commands, Attachment, Butt
 from discord.ext import commands
 import google.genai as genai
 import google.genai.types as types
+from google.genai.types import Tool, GenerateContentConfig, GoogleSearch
 from bs4 import BeautifulSoup
 import aiohttp
 from typing import Optional, Dict, List, Tuple
@@ -38,6 +39,7 @@ Jawab dengan bahasa Indonesia. Pastikan output rapi dan mudah dibaca di Discord 
 - Pisahkan paragraf dengan baris kosong.
 - Batasi pesan agar tidak melebihi 2000 karakter.
 - Jika ada tautan GIF dari Tenor, jangan analisis kontennya, tetapi respon seperti manusia biasa dengan nada ramah dan santai, misalnya "Haha, GIF-nya lucu banget, makasih ya!" atau sesuai konteks.
+- Jika ada URL yang diberikan, gunakan sebagai konteks untuk menjawab pertanyaan.
 """
 
 class BotState:
@@ -132,6 +134,11 @@ async def google_search(query: str) -> str:
         logger.error(f'Error di googleSearch: {error}')
         return "**Error**\nTerjadi kesalahan saat melakukan pencarian Google."
 
+def extract_urls(text: str) -> List[str]:
+    url_pattern = r'(https?://[^\s]+)'
+    urls = re.findall(url_pattern, text)
+    return [url for url in urls if not (re.search(r'tenor\.com', url) or re.search(r'youtube\.com|youtu\.be', url))]
+
 def extract_youtube_url(text: str) -> Optional[str]:
     youtube_patterns = [
         r'(https?://(?:www\.)?youtube\.com/watch\?v=[\w-]+)',
@@ -151,16 +158,23 @@ def extract_tenor_url(text: str) -> Optional[str]:
 
 async def generate_response(channel_id: str, prompt: str, media_data: Optional[Dict] = None,
                            search_query: Optional[str] = None, use_thinking: bool = False,
-                           youtube_url: Optional[str] = None, tenor_url: Optional[str] = None) -> str:
+                           youtube_url: Optional[str] = None, tenor_url: Optional[str] = None,
+                           urls: Optional[List[str]] = None) -> str:
     try:
         model_name = "gemini-2.5-pro" if use_thinking else "gemini-2.5-flash"
         if channel_id not in bot_state.conversation_history:
+            url_context_tool = Tool(url_context=types.UrlContext())
+            tools = [url_context_tool]
+            if search_query:
+                tools.append(Tool(google_search=types.GoogleSearch()))
+            
             bot_state.conversation_history[channel_id] = client.chats.create(
                 model=model_name,
                 config=types.GenerateContentConfig(
                     system_instruction=system_prompt,
                     temperature=0.9,
-                    max_output_tokens=4000))
+                    max_output_tokens=4000,
+                    tools=tools))
         chat = bot_state.conversation_history[channel_id]
         contents = [prompt]
         if search_query:
@@ -187,9 +201,21 @@ async def generate_response(channel_id: str, prompt: str, media_data: Optional[D
                 types.Part(file_data=types.FileData(file_uri=youtube_url)))
         if tenor_url:
             contents.append(tenor_url)
+        if urls:
+            for url in urls:
+                web_content = await fetch_web_content(url)
+                contents.append(f"Konten dari {url}:\n{web_content}")
         loop = asyncio.get_event_loop()
         response = await loop.run_in_executor(None, lambda: chat.send_message(contents))
         response_text = response.text
+        if hasattr(response.candidates[0], 'url_context_metadata'):
+            url_metadata = response.candidates[0].url_context_metadata
+            if url_metadata and url_metadata.url_metadata:
+                response_text += "\n\n**Sumber URL yang Digunakan:**\n"
+                for meta in url_metadata.url_metadata:
+                    status = meta.url_retrieval_status
+                    status_text = "Berhasil" if status == types.UrlRetrievalStatus.URL_RETRIEVAL_STATUS_SUCCESS else "Gagal"
+                    response_text += f"- {meta.retrieved_url}: {status_text}\n"
         if not any(marker in response_text for marker in ['#', '-', '```']):
             paragraphs = [p.strip() for p in response_text.split('\n\n') if p.strip()]
             response_text = '\n\n' + '\n\n'.join(paragraphs)
@@ -425,6 +451,7 @@ async def on_message(message):
                 return
             attachment = message.attachments[0] if message.attachments else None
             media_data = None
+            urls = extract_urls(thinking_prompt)
             if attachment:
                 mime_type = attachment.content_type
                 if mime_type not in SUPPORTED_MIME_TYPES:
@@ -440,7 +467,7 @@ async def on_message(message):
                 base64_data = base64.b64encode(file_data).decode('utf-8')
                 media_data = {'mime_type': mime_type, 'base64': base64_data}
             try:
-                ai_response = await generate_response(channel_id, thinking_prompt, media_data, None, True)
+                ai_response = await generate_response(channel_id, thinking_prompt, media_data, None, True, None, None, urls)
                 response_chunks = split_text(ai_response)
                 for i, chunk in enumerate(response_chunks):
                     await message.channel.send(chunk)
@@ -451,52 +478,13 @@ async def on_message(message):
                 await message.channel.send(
                     "**Error**\nTerjadi kesalahan saat memproses permintaan thinking.")
         return
-    if content.lower().startswith('!gift'):
-        async with message.channel.typing():
-            gift_prompt = content.replace('!gift', '', 1).strip()
-            if not gift_prompt:
-                await message.reply('**Error**\nGunakan format: `!gift [pertanyaan atau permintaan]`')
-                return
-            attachment = message.attachments[0] if message.attachments else None
-            media_data = None
-            tenor_url = extract_tenor_url(content)
-            if attachment:
-                mime_type = attachment.content_type
-                if mime_type not in SUPPORTED_MIME_TYPES:
-                    supported_formats = ', '.join(set(SUPPORTED_MIME_TYPES.keys()))
-                    await message.reply(
-                        f'**Error**\nFormat file tidak didukung.\n**Format yang didukung:** {supported_formats}')
-                    return
-                file_data = await download_attachment(attachment)
-                if file_data is None:
-                    await message.reply(
-                        '**Error**\nGagal mengunduh file atau file terlalu besar (maksimal 25MB)!')
-                    return
-                base64_data = base64.b64encode(file_data).decode('utf-8')
-                media_data = {'mime_type': mime_type, 'base64': base64_data}
-            try:
-                ai_response = await generate_response(channel_id, gift_prompt, media_data, None, False, None, tenor_url)
-                response_chunks = split_text(ai_response)
-                for i, chunk in enumerate(response_chunks):
-                    await message.channel.send(chunk)
-                    if i < len(response_chunks) - 1:
-                        await asyncio.sleep(0.5)
-            except Exception as e:
-                logger.error(f'Error in gift command: {e}')
-                await message.channel.send("**Error**\nTerjadi kesalahan saat memproses permintaan.")
-        return
-    if is_bot_active or content.startswith('!chat') or content.startswith('!cari'):
+    if is_bot_active or content.startswith('!chat'):
         prompt = content
         search_query = None
         youtube_url = extract_youtube_url(content)
         tenor_url = extract_tenor_url(content)
-        if content.startswith('!cari'):
-            search_query = content.replace('!cari', '', 1).strip()
-            if not search_query:
-                await message.reply('**Error**\nGunakan format: `!cari [kata kunci pencarian]`')
-                return
-            prompt = f"Berikan jawaban berdasarkan pencarian untuk: {search_query}"
-        elif content.startswith('!chat'):
+        urls = extract_urls(content)
+        if content.startswith('!chat'):
             chat_prompt = content.replace('!chat', '', 1).strip()
             if not chat_prompt:
                 await message.reply('**Error**\nGunakan format: `!chat [pertanyaan atau pesan]`')
@@ -521,7 +509,7 @@ async def on_message(message):
                 media_data = {'mime_type': mime_type, 'base64': base64_data}
                 try:
                     ai_response = await generate_response(
-                        channel_id, prompt, media_data, search_query, False, youtube_url, tenor_url)
+                        channel_id, prompt, media_data, search_query, False, youtube_url, tenor_url, urls)
                     response_chunks = split_text(ai_response)
                     for i, chunk in enumerate(response_chunks):
                         await message.channel.send(chunk)
@@ -535,7 +523,7 @@ async def on_message(message):
             async with message.channel.typing():
                 try:
                     ai_response = await generate_response(
-                        channel_id, prompt, None, search_query, False, youtube_url, tenor_url)
+                        channel_id, prompt, None, search_query, False, youtube_url, tenor_url, urls)
                     response_chunks = split_text(ai_response)
                     for i, chunk in enumerate(response_chunks):
                         await message.channel.send(chunk)
@@ -560,7 +548,6 @@ async def on_error(event, *args, **kwargs):
 
 @bot.event
 async def on_command_error(ctx, error):
-    
     if isinstance(error, commands.CommandOnCooldown):
         await ctx.send(
             f"⏰ Command sedang cooldown. Coba lagi dalam {error.retry_after:.1f} detik.")

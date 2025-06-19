@@ -1,6 +1,5 @@
 python-dotenv
 discord.py
-google-genai
 aiohttp
 beautifulsoup4
 Pillow
