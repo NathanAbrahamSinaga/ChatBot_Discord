@@ -15,6 +15,9 @@ import aiohttp
 from typing import Optional, Dict, List, Tuple
 import re
 import wave
+import json
+from datetime import datetime, timezone
+import lxml
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -50,6 +53,8 @@ class BotState:
         self.channel_activity: Dict[str, bool] = {}
         self.last_activity: Dict[str, float] = {}
         self.last_button_message: Dict[str, any] = {}
+        self.bmkg_alerts: Dict[str, bool] = {}
+        self.last_earthquake_id: Dict[str, str] = {}
 
     def cleanup_old_data(self):
         current_time = time.time()
@@ -65,6 +70,7 @@ bot_state = BotState()
 COOLDOWN_TIME = 30
 MAX_FILE_SIZE = 25 * 1024 * 1024
 INACTIVITY_TIMEOUT = 600
+EARTHQUAKE_CHECK_INTERVAL = 60
 
 SUPPORTED_MIME_TYPES = {
     'image/jpeg': 'image',
@@ -228,10 +234,6 @@ async def generate_response(channel_id: str, prompt: str, media_data: Optional[D
         return f"**Error**\nTerjadi kesalahan saat menghasilkan respons: {str(error)}"
 
 async def generate_tts_audio(prompt: str, language: str) -> Optional[bytes]:
-    """
-    Generates TTS audio from text prompt using Gemini API.
-    Supports Indonesian (id-ID), English (en-US), and Japanese (ja-JP).
-    """
     try:
         language_config = {
             'id-ID': {'voice_name': 'Puck', 'bcp_code': 'id-ID'},
@@ -271,10 +273,6 @@ async def generate_tts_audio(prompt: str, language: str) -> Optional[bytes]:
         return None
 
 def save_temp_wav(audio_data: bytes) -> str:
-    """
-    Saves audio data to a temporary WAV file.
-    Returns the file path.
-    """
     temp_file = f"temp_{int(time.time())}.wav"
     with wave.open(temp_file, "wb") as wf:
         wf.setnchannels(1)
@@ -382,6 +380,88 @@ intents = Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
+async def fetch_earthquake_data() -> Optional[Dict]:
+    try:
+        session = await get_http_session()
+        url = "https://data.bmkg.go.id/DataMKG/TEWS/autogempa.json"
+        async with session.get(url) as response:
+            if response.status != 200:
+                logger.error(f"Failed to fetch earthquake data: HTTP {response.status}")
+                return None
+            data = await response.json()
+        return data['Infogempa']['gempa']
+    except Exception as e:
+        logger.error(f"Error fetching earthquake data: {e}")
+        return None
+
+async def bmkg_alert_task():
+    while True:
+        for channel_id in list(bot_state.bmkg_alerts):
+            if bot_state.bmkg_alerts.get(channel_id, False):
+                channel = bot.get_channel(int(channel_id))
+                if not channel:
+                    continue
+                earthquake_data = await fetch_earthquake_data()
+                if earthquake_data:
+                    eq_id = earthquake_data.get('Infogempa', {}).get('gempa', {}).get('Dirasakan', '')
+                    last_eq_id = bot_state.last_earthquake_id.get(channel_id, '')
+                    if eq_id and eq_id != last_eq_id:
+                        # Perubahan: Desain Embed yang lebih menarik dan terstruktur
+                        embed = Embed(
+                            title="🌍 Peringatan Gempa Bumi Terkini",
+                            description="**Informasi gempa terbaru dari BMKG**",
+                            color=Color.red(),
+                            timestamp=datetime.now(timezone.utc)
+                        )
+                        # Menambahkan thumbnail logo BMKG
+                        embed.set_thumbnail(url="https://www.bmkg.go.id/asset/img/logo-bmkg.png")
+                        # Menambahkan emoji dan format yang lebih rapi
+                        embed.add_field(
+                            name="📅 Tanggal & Waktu",
+                            value=f"{earthquake_data.get('Tanggal')} {earthquake_data.get('Jam')}",
+                            inline=False
+                        )
+                        embed.add_field(
+                            name="💪 Magnitudo",
+                            value=f"{earthquake_data.get('Magnitude')} SR",
+                            inline=True
+                        )
+                        embed.add_field(
+                            name="📏 Kedalaman",
+                            value=earthquake_data.get('Kedalaman'),
+                            inline=True
+                        )
+                        embed.add_field(
+                            name="📍 Lokasi",
+                            value=earthquake_data.get('Wilayah'),
+                            inline=False
+                        )
+                        embed.add_field(
+                            name="🌐 Koordinat",
+                            value=f"{earthquake_data.get('Lintang')}, {earthquake_data.get('Bujur')}",
+                            inline=True
+                        )
+                        # Menyoroti potensi tsunami dengan emoji peringatan
+                        tsunami_potential = earthquake_data.get('Potensi')
+                        tsunami_text = f"⚠️ {tsunami_potential}" if "Tsunami" in tsunami_potential else tsunami_potential
+                        embed.add_field(
+                            name="🌊 Potensi Tsunami",
+                            value=tsunami_text,
+                            inline=True
+                        )
+                        # Footer dengan link ke situs BMKG
+                        embed.set_footer(
+                            text="Sumber: Badan Meteorologi, Klimatologi, dan Geofisika",
+                            icon_url="https://www.bmkg.go.id/asset/img/logo-bmkg.png"
+                        )
+                        # Menambahkan tautan ke peta gempa (jika tersedia)
+                        shakemap = earthquake_data.get('Shakemap', '')
+                        if shakemap:
+                            embed.set_image(url=f"https://data.bmkg.go.id/DataMKG/TEWS/{shakemap}")
+                        await channel.send(embed=embed)
+                        bot_state.last_earthquake_id[channel_id] = eq_id
+        await asyncio.sleep(EARTHQUAKE_CHECK_INTERVAL)
+
 @bot.event
 async def on_ready():
     logger.info(f'Bot {bot.user} siap!')
@@ -390,6 +470,7 @@ async def on_ready():
         logger.info(f"Synced {len(synced)} command(s)")
         bot.loop.create_task(periodic_cleanup())
         bot.loop.create_task(check_inactivity())
+        bot.loop.create_task(bmkg_alert_task())
     except Exception as e:
         logger.error(f"Failed to sync commands: {e}")
 
@@ -492,8 +573,80 @@ async def on_message(message):
             await bot_state.last_button_message[channel_id].delete()
             del bot_state.last_button_message[channel_id]
         except Exception as e:
-            logger.error(f"Error deleting button message: {e}")
-            
+            logger.error(f"Error deleting event {e}")
+
+    if content.lower() == '!bmkg_test':
+        on_cooldown, remaining_time = check_cooldown(user_id, "bmkg_test")
+        if on_cooldown:
+            await message.reply(
+                f"**Cooldown**\nSilakan tunggu {remaining_time:.1f} detik sebelum sebelum menggunakan perintah ini lagi.")
+            return
+        async with message.channel.typing():
+            earthquake_data = await fetch_earthquake_data()
+            if earthquake_data:
+                # Perubahan: Menyesuaikan tampilan untuk perintah !bmkg_test agar seragam dengan alert
+                embed = Embed(
+                    title="🌍 Tes Peringatan Gempa Bumi",
+                    description="**Informasi gempa terbaru dari BMKG (Tes)**",
+                    color=Color.red(),
+                    timestamp=datetime.now(timezone.utc)
+                )
+                embed.set_thumbnail(url="https://www.bmkg.go.id/asset/img/logo-bmkg.png")
+                embed.add_field(
+                    name="📅 Tanggal & Waktu",
+                    value=f"{earthquake_data.get('Tanggal')} {earthquake_data.get('Jam')}",
+                    inline=False
+                )
+                embed.add_field(
+                    name="💪 Magnitudo",
+                    value=f"{earthquake_data.get('Magnitude')} SR",
+                    inline=True
+                )
+                embed.add_field(
+                    name="📏 Kedalaman",
+                    value=earthquake_data.get('Kedalaman'),
+                    inline=True
+                )
+                embed.add_field(
+                    name="📍 Lokasi",
+                    value=earthquake_data.get('Wilayah'),
+                    inline=False
+                )
+                embed.add_field(
+                    name="🌐 Koordinat",
+                    value=f"{earthquake_data.get('Lintang')}, {earthquake_data.get('Bujur')}",
+                    inline=True
+                )
+                tsunami_potential = earthquake_data.get('Potensi')
+                tsunami_text = f"⚠️ {tsunami_potential}" if "Tsunami" in tsunami_potential else tsunami_potential
+                embed.add_field(
+                    name="🌊 Potensi Tsunami",
+                    value=tsunami_text,
+                    inline=True
+                )
+                embed.set_footer(
+                    text="Sumber: Badan Meteorologi, Klimatologi, dan Geofisika",
+                    icon_url="https://www.bmkg.go.id/asset/img/logo-bmkg.png"
+                )
+                shakemap = earthquake_data.get('Shakemap', '')
+                if shakemap:
+                    embed.set_image(url=f"https://data.bmkg.go.id/DataMKG/TEWS/{shakemap}")
+                await message.channel.send(embed=embed)
+            else:
+                await message.channel.send("**Tes Gempa Bumi**\nGagal mengambil data gempa terbaru dari BMKG.")
+        return
+
+    if content.lower() == '!bmkg':
+        on_cooldown, remaining_time = check_cooldown(user_id, "bmkg")
+        if on_cooldown:
+            await message.reply(
+                f"**Cooldown**\nSilakan tunggu {remaining_time:.1f} detik sebelum menggunakan perintah ini lagi.")
+            return
+        bot_state.bmkg_alerts[channel_id] = not bot_state.bmkg_alerts.get(channel_id, False)
+        status = "diaktifkan" if bot_state.bmkg_alerts[channel_id] else "dinonaktifkan"
+        await message.reply(f"**Status**\nPeringatan gempa bumi telah {status} di channel ini!")
+        return
+
     if content.lower().startswith('!suara'):
         async with message.channel.typing():
             tts_prompt = content.replace('!suara', '', 1).strip()
@@ -530,6 +683,7 @@ async def on_message(message):
         else:
             await message.channel.send('ℹ️ Tidak ada riwayat percakapan yang perlu dihapus')
         return
+
     if content.lower().startswith('!think'):
         async with message.channel.typing():
             thinking_prompt = content.replace('!think', '', 1).strip()
@@ -565,6 +719,7 @@ async def on_message(message):
                 await message.channel.send(
                     "**Error**\nTerjadi kesalahan saat memproses permintaan thinking.")
         return
+
     if is_bot_active or content.startswith('!chat'):
         prompt = content
         search_query = None
