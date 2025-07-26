@@ -264,13 +264,57 @@ async def generate_tts_audio(prompt: str, language: str) -> Optional[bytes]:
                 )
             )
         )
-        
-        audio_data = response.candidates[0].content.parts[0].inline_data.data
+
+        audio_data = response.candidates.content.parts.inline_data.data
         return audio_data
         
     except Exception as e:
         logger.error(f'Error in generate_tts_audio: {e}')
         return None
+
+async def generate_video_with_veo(prompt: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Membuat video menggunakan Veo 3 dari prompt teks.
+    Mengembalikan path file video yang disimpan dan pesan error jika ada.
+    """
+    try:
+        operation = client.models.generate_videos(
+            model="veo-3.0-generate-preview",
+            prompt=prompt,
+        )
+        logger.info(f"Memulai pembuatan video untuk prompt: {prompt}")
+
+        loop = asyncio.get_event_loop()
+
+        while not operation.done:
+            await asyncio.sleep(10)
+            operation = await loop.run_in_executor(None, lambda: client.operations.get(operation))
+
+        logger.info("Pembuatan video selesai.")
+
+        if hasattr(operation, 'error') and operation.error:
+             error_message = f"Gagal membuat video. Detail: {operation.error.message}"
+             logger.error(error_message)
+             return None, error_message
+
+        if hasattr(operation, 'response') and operation.response and operation.response.generated_videos:
+            generated_video = operation.response.generated_videos
+            video_file_name = f"veo_{int(time.time())}.mp4"
+            
+            def save_video_sync():
+                client.files.download(file=generated_video.video)
+                generated_video.video.save(video_file_name)
+
+            await loop.run_in_executor(None, save_video_sync)
+            
+            logger.info(f"Video disimpan ke {video_file_name}")
+            return video_file_name, None
+        else:
+            return None, "Gagal membuat video: Tidak ada video yang dihasilkan dalam respons."
+
+    except Exception as e:
+        logger.error(f"Error di generate_video_with_veo: {e}")
+        return None, f"Terjadi kesalahan teknis saat membuat video: {e}"
 
 def save_temp_wav(audio_data: bytes) -> str:
     temp_file = f"temp_{int(time.time())}.wav"
@@ -334,7 +378,10 @@ def check_cooldown(user_id: str, command: str) -> Tuple[bool, float]:
     if current_time < cooldown_end_time:
         remaining_time = cooldown_end_time - current_time
         return True, remaining_time
-    bot_state.command_cooldowns[cooldown_key] = current_time + COOLDOWN_TIME
+    video_cooldown = 120
+    normal_cooldown = 30
+    cooldown_duration = video_cooldown if command == "video" else normal_cooldown
+    bot_state.command_cooldowns[cooldown_key] = current_time + cooldown_duration
     return False, 0
 
 class InteractionButtons(ui.View):
@@ -406,16 +453,13 @@ async def bmkg_alert_task():
                     eq_id = earthquake_data.get('Infogempa', {}).get('gempa', {}).get('Dirasakan', '')
                     last_eq_id = bot_state.last_earthquake_id.get(channel_id, '')
                     if eq_id and eq_id != last_eq_id:
-                        # Perubahan: Desain Embed yang lebih menarik dan terstruktur
                         embed = Embed(
                             title="🌍 Peringatan Gempa Bumi Terkini",
                             description="**Informasi gempa terbaru dari BMKG**",
                             color=Color.red(),
                             timestamp=datetime.now(timezone.utc)
                         )
-                        # Menambahkan thumbnail logo BMKG
                         embed.set_thumbnail(url="https://www.bmkg.go.id/asset/img/logo-bmkg.png")
-                        # Menambahkan emoji dan format yang lebih rapi
                         embed.add_field(
                             name="📅 Tanggal & Waktu",
                             value=f"{earthquake_data.get('Tanggal')} {earthquake_data.get('Jam')}",
@@ -441,7 +485,6 @@ async def bmkg_alert_task():
                             value=f"{earthquake_data.get('Lintang')}, {earthquake_data.get('Bujur')}",
                             inline=True
                         )
-                        # Menyoroti potensi tsunami dengan emoji peringatan
                         tsunami_potential = earthquake_data.get('Potensi')
                         tsunami_text = f"⚠️ {tsunami_potential}" if "Tsunami" in tsunami_potential else tsunami_potential
                         embed.add_field(
@@ -449,12 +492,10 @@ async def bmkg_alert_task():
                             value=tsunami_text,
                             inline=True
                         )
-                        # Footer dengan link ke situs BMKG
                         embed.set_footer(
                             text="Sumber: Badan Meteorologi, Klimatologi, dan Geofisika",
                             icon_url="https://www.bmkg.go.id/asset/img/logo-bmkg.png"
                         )
-                        # Menambahkan tautan ke peta gempa (jika tersedia)
                         shakemap = earthquake_data.get('Shakemap', '')
                         if shakemap:
                             embed.set_image(url=f"https://data.bmkg.go.id/DataMKG/TEWS/{shakemap}")
@@ -584,7 +625,6 @@ async def on_message(message):
         async with message.channel.typing():
             earthquake_data = await fetch_earthquake_data()
             if earthquake_data:
-                # Perubahan: Menyesuaikan tampilan untuk perintah !bmkg_test agar seragam dengan alert
                 embed = Embed(
                     title="🌍 Tes Peringatan Gempa Bumi",
                     description="**Informasi gempa terbaru dari BMKG (Tes)**",
@@ -674,6 +714,44 @@ async def on_message(message):
                 await message.channel.send(file=audio_file)
                 
             os.remove(temp_file)
+        return
+
+    if content.lower().startswith('!video'):
+        on_cooldown, remaining_time = check_cooldown(user_id, "video")
+        if on_cooldown:
+            await message.reply(
+                f"**Cooldown Video**\nPerintah ini memiliki cooldown lebih lama. Silakan tunggu {remaining_time:.1f} detik lagi.")
+            return
+
+        video_prompt = content.replace('!video', '', 1).strip()
+        if not video_prompt:
+            await message.reply('**Error**\nGunakan format: `!video [deskripsi adegan video]`')
+            return
+
+        await message.reply(f"⏳ **Membuat Video...**\nPrompt: `{video_prompt}`\nProses ini bisa memakan waktu beberapa menit. Harap bersabar!")
+
+        video_path, error = await generate_video_with_veo(video_prompt)
+
+        if error:
+            await message.channel.send(f"**Gagal Membuat Video**\nMaaf, terjadi kesalahan:\n`{error}`")
+            return
+        
+        if video_path:
+            try:
+                if os.path.getsize(video_path) > MAX_FILE_SIZE:
+                    await message.channel.send("**Error Ukuran File**\nVideo yang dihasilkan terlalu besar untuk diunggah ke Discord (di atas 25MB).")
+                else:
+                    with open(video_path, 'rb') as f:
+                        video_file = File(f, filename=os.path.basename(video_path))
+                        await message.channel.send(f"✅ **Video Selesai!**\nBerikut adalah video untuk prompt: `{video_prompt}`", file=video_file)
+            except Exception as e:
+                logger.error(f"Gagal memproses atau mengirim file video: {e}")
+                await message.channel.send("**Error**\nGagal memproses atau mengirim file video ke Discord.")
+            finally:
+                if os.path.exists(video_path):
+                    os.remove(video_path)
+        else:
+            await message.channel.send("**Error**\nTerjadi kesalahan yang tidak diketahui saat membuat video.")
         return
         
     if content.lower() == '!reset':
