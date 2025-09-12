@@ -17,6 +17,7 @@ import re
 import json
 from datetime import datetime, timezone
 import lxml
+from collections import Counter, defaultdict
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -45,6 +46,133 @@ Jawab dengan bahasa Indonesia. Pastikan output rapi dan mudah dibaca di Discord 
 - Jika ada URL yang diberikan, gunakan sebagai konteks untuk menjawab pertanyaan.
 """
 
+trend_analysis_prompt = """
+Analisis percakapan berikut dan berikan kesimpulan dalam format yang rapi untuk Discord:
+
+1. **Topik Utama yang Dibahas** - list 5-10 topik paling sering muncul
+2. **Jenis Pertanyaan Favorit** - kategori pertanyaan yang paling sering ditanya
+3. **Pola Interaksi** - waktu paling aktif, panjang percakapan rata-rata
+4. **Minat dan Preferensi** - tema yang paling menarik bagi user
+5. **Saran** - rekomendasi topik untuk eksplorasi lebih lanjut
+
+Gunakan emoji dan format markdown yang menarik. Maksimal 1500 karakter.
+"""
+
+class ConversationTracker:
+    def __init__(self):
+        self.messages = defaultdict(list)
+        self.topics = defaultdict(Counter)
+        self.timestamps = defaultdict(list)
+        self.question_types = defaultdict(Counter)
+        self.user_interests = defaultdict(Counter)
+    
+    def add_message(self, channel_id: str, user_id: str, content: str, timestamp: float):
+        message_data = {
+            'user_id': user_id,
+            'content': content,
+            'timestamp': timestamp,
+            'datetime': datetime.fromtimestamp(timestamp)
+        }
+        self.messages[channel_id].append(message_data)
+        self.timestamps[channel_id].append(timestamp)
+        
+        self._extract_topics(channel_id, content)
+        self._classify_question_type(channel_id, content)
+        self._extract_interests(channel_id, user_id, content)
+    
+    def _extract_topics(self, channel_id: str, content: str):
+        content_lower = content.lower()
+        tech_keywords = ['python', 'javascript', 'coding', 'programming', 'ai', 'machine learning', 'discord', 'bot', 'api']
+        science_keywords = ['fisika', 'kimia', 'biologi', 'matematika', 'sains', 'research', 'study']
+        general_keywords = ['cara', 'bagaimana', 'mengapa', 'apa itu', 'tutorial', 'belajar', 'help']
+        entertainment_keywords = ['game', 'musik', 'film', 'anime', 'entertainment', 'fun', 'meme']
+        business_keywords = ['bisnis', 'marketing', 'startup', 'investasi', 'uang', 'karir']
+        
+        for keyword in tech_keywords:
+            if keyword in content_lower:
+                self.topics[channel_id]['Teknologi'] += 1
+        for keyword in science_keywords:
+            if keyword in content_lower:
+                self.topics[channel_id]['Sains & Pendidikan'] += 1
+        for keyword in general_keywords:
+            if keyword in content_lower:
+                self.topics[channel_id]['Bantuan Umum'] += 1
+        for keyword in entertainment_keywords:
+            if keyword in content_lower:
+                self.topics[channel_id]['Hiburan'] += 1
+        for keyword in business_keywords:
+            if keyword in content_lower:
+                self.topics[channel_id]['Bisnis & Karir'] += 1
+    
+    def _classify_question_type(self, channel_id: str, content: str):
+        content_lower = content.lower()
+        if any(word in content_lower for word in ['cara', 'bagaimana', 'how to']):
+            self.question_types[channel_id]['Tutorial/Panduan'] += 1
+        elif any(word in content_lower for word in ['apa', 'what', 'definisi']):
+            self.question_types[channel_id]['Definisi/Penjelasan'] += 1
+        elif any(word in content_lower for word in ['mengapa', 'kenapa', 'why']):
+            self.question_types[channel_id]['Analisis/Alasan'] += 1
+        elif any(word in content_lower for word in ['help', 'tolong', 'bantuan', 'error']):
+            self.question_types[channel_id]['Bantuan/Troubleshooting'] += 1
+        elif any(word in content_lower for word in ['rekomendasikan', 'saran', 'recommend']):
+            self.question_types[channel_id]['Rekomendasi'] += 1
+    
+    def _extract_interests(self, channel_id: str, user_id: str, content: str):
+        words = content.lower().split()
+        for word in words:
+            if len(word) > 3:
+                self.user_interests[f"{channel_id}_{user_id}"][word] += 1
+    
+    def get_trend_analysis(self, channel_id: str) -> str:
+        if channel_id not in self.messages or not self.messages[channel_id]:
+            return "📊 **Analisis Trend**\n\nBelum ada data percakapan untuk dianalisis."
+        
+        messages = self.messages[channel_id]
+        total_messages = len(messages)
+        
+        top_topics = self.topics[channel_id].most_common(5)
+        top_question_types = self.question_types[channel_id].most_common(3)
+        
+        recent_messages = [msg for msg in messages if time.time() - msg['timestamp'] < 86400]
+        active_hours = Counter([msg['datetime'].hour for msg in messages])
+        most_active_hour = active_hours.most_common(1)[0] if active_hours else (12, 0)
+        
+        analysis = f"📊 **Analisis Trend Percakapan**\n\n"
+        analysis += f"💬 **Total Pesan:** {total_messages}\n"
+        analysis += f"📅 **Pesan Hari Ini:** {len(recent_messages)}\n"
+        analysis += f"⏰ **Jam Teraktif:** {most_active_hour[0]:02d}:00\n\n"
+        
+        if top_topics:
+            analysis += f"🔥 **Topik Terpopuler:**\n"
+            for i, (topic, count) in enumerate(top_topics, 1):
+                percentage = (count / total_messages) * 100
+                analysis += f"{i}. {topic}: {count} pesan ({percentage:.1f}%)\n"
+            analysis += "\n"
+        
+        if top_question_types:
+            analysis += f"❓ **Jenis Pertanyaan Favorit:**\n"
+            for i, (q_type, count) in enumerate(top_question_types, 1):
+                analysis += f"{i}. {q_type}: {count}x\n"
+            analysis += "\n"
+        
+        avg_msg_length = sum(len(msg['content']) for msg in messages) / total_messages if messages else 0
+        analysis += f"📝 **Rata-rata Panjang Pesan:** {avg_msg_length:.0f} karakter\n\n"
+        
+        suggestions = []
+        if not any('Teknologi' in topic for topic, _ in top_topics):
+            suggestions.append("💻 Eksplorasi topik teknologi dan programming")
+        if not any('Sains' in topic for topic, _ in top_topics):
+            suggestions.append("🔬 Pelajari sains dan pengetahuan umum")
+        if avg_msg_length < 50:
+            suggestions.append("📚 Coba pertanyaan yang lebih detail untuk jawaban mendalam")
+        
+        if suggestions:
+            analysis += f"💡 **Saran Eksplorasi:**\n"
+            for suggestion in suggestions[:3]:
+                analysis += f"- {suggestion}\n"
+        
+        return analysis
+
 class BotState:
     def __init__(self):
         self.conversation_history: Dict[str, any] = {}
@@ -52,6 +180,7 @@ class BotState:
         self.channel_activity: Dict[str, bool] = {}
         self.last_activity: Dict[str, float] = {}
         self.last_button_message: Dict[str, any] = {}
+        self.tracker = ConversationTracker()
 
     def cleanup_old_data(self):
         current_time = time.time()
@@ -228,6 +357,52 @@ async def generate_response(channel_id: str, prompt: str, media_data: Optional[D
     except Exception as error:
         logger.error(f'Error di generateResponse: {error}')
         return f"**Error**\nTerjadi kesalahan saat menghasilkan respons: {str(error)}"
+
+async def generate_trend_analysis(channel_id: str) -> str:
+    try:
+        if channel_id not in bot_state.conversation_history:
+            return "📊 **Analisis Trend**\n\nBelum ada riwayat percakapan untuk dianalisis."
+        
+        messages_data = []
+        for message_data in bot_state.tracker.messages[channel_id]:
+            messages_data.append(f"User: {message_data['content']}")
+        
+        if len(messages_data) < 5:
+            return bot_state.tracker.get_trend_analysis(channel_id)
+        
+        conversation_text = "\n".join(messages_data[-50:])
+        
+        chat = client.chats.create(
+            model="gemini-2.5-flash",
+            config=types.GenerateContentConfig(
+                system_instruction=trend_analysis_prompt,
+                temperature=0.7,
+                max_output_tokens=2000))
+        
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(None, lambda: chat.send_message([conversation_text]))
+        
+        basic_analysis = bot_state.tracker.get_trend_analysis(channel_id)
+        ai_analysis = response.text
+        
+        return f"{basic_analysis}\n\n🤖 **Analisis AI:**\n{ai_analysis}"
+        
+    except Exception as error:
+        logger.error(f'Error generating trend analysis: {error}')
+        return bot_state.tracker.get_trend_analysis(channel_id)
+
+async def generate_trend_analysis_embed(channel_id: str) -> Embed:
+    analysis_text = await generate_trend_analysis(channel_id)
+    
+    embed = Embed(
+        title="📊 Analisis Trend Percakapan",
+        description=analysis_text,
+        color=Color.blue(),
+        timestamp=datetime.now()
+    )
+    embed.set_footer(text="Analisis diperbarui otomatis")
+    
+    return embed
 
 def split_text(text: str, max_length: int = 1900) -> List[str]:
     if len(text) <= max_length:
@@ -429,6 +604,9 @@ async def on_message(message):
     content = message.content.strip()
     user_id = str(message.author.id)
     current_time = time.time()
+    
+    bot_state.tracker.add_message(channel_id, user_id, content, current_time)
+    
     user_last_message = bot_state.command_cooldowns.get(f"{user_id}-message", 0)
     if current_time - user_last_message < 2:
         return
@@ -447,6 +625,16 @@ async def on_message(message):
             await message.channel.send('✅ Riwayat percakapan di channel ini telah direset!')
         else:
             await message.channel.send('ℹ️ Tidak ada riwayat percakapan yang perlu dihapus')
+        return
+
+    if content.lower() == '!kesimpulan':
+        async with message.channel.typing():
+            try:
+                embed = await generate_trend_analysis_embed(channel_id)
+                await message.channel.send(embed=embed)
+            except Exception as e:
+                logger.error(f'Error generating trend analysis: {e}')
+                await message.channel.send("**Error**\nTerjadi kesalahan saat menghasilkan analisis trend.")
         return
 
     if content.lower().startswith('!think'):
@@ -517,6 +705,7 @@ async def on_message(message):
                 try:
                     ai_response = await generate_response(
                         channel_id, prompt, media_data, search_query, False, youtube_url, tenor_url, urls)
+                    bot_state.tracker.add_message(channel_id, "bot", ai_response, current_time)
                     response_chunks = split_text(ai_response)
                     for i, chunk in enumerate(response_chunks):
                         await message.channel.send(chunk)
@@ -531,6 +720,7 @@ async def on_message(message):
                 try:
                     ai_response = await generate_response(
                         channel_id, prompt, None, search_query, False, youtube_url, tenor_url, urls)
+                    bot_state.tracker.add_message(channel_id, "bot", ai_response, current_time)
                     response_chunks = split_text(ai_response)
                     for i, chunk in enumerate(response_chunks):
                         await message.channel.send(chunk)
