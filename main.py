@@ -14,7 +14,6 @@ from bs4 import BeautifulSoup
 import aiohttp
 from typing import Optional, Dict, List, Tuple
 import re
-import wave
 import json
 from datetime import datetime, timezone
 import lxml
@@ -53,8 +52,6 @@ class BotState:
         self.channel_activity: Dict[str, bool] = {}
         self.last_activity: Dict[str, float] = {}
         self.last_button_message: Dict[str, any] = {}
-        self.bmkg_alerts: Dict[str, bool] = {}
-        self.last_earthquake_id: Dict[str, str] = {}
 
     def cleanup_old_data(self):
         current_time = time.time()
@@ -70,7 +67,6 @@ bot_state = BotState()
 COOLDOWN_TIME = 30
 MAX_FILE_SIZE = 25 * 1024 * 1024
 INACTIVITY_TIMEOUT = 600
-EARTHQUAKE_CHECK_INTERVAL = 60
 
 SUPPORTED_MIME_TYPES = {
     'image/jpeg': 'image',
@@ -233,98 +229,6 @@ async def generate_response(channel_id: str, prompt: str, media_data: Optional[D
         logger.error(f'Error di generateResponse: {error}')
         return f"**Error**\nTerjadi kesalahan saat menghasilkan respons: {str(error)}"
 
-async def generate_tts_audio(prompt: str, language: str) -> Optional[bytes]:
-    try:
-        language_config = {
-            'id-ID': {'voice_name': 'Puck', 'bcp_code': 'id-ID'},
-            'en-US': {'voice_name': 'Kore', 'bcp_code': 'en-US'},
-            'ja-JP': {'voice_name': 'Leda', 'bcp_code': 'ja-JP'}
-        }
-        
-        if language not in language_config:
-            return None
-            
-        config = language_config[language]
-        voice_name = config['voice_name']
-        
-        response = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: client.models.generate_content(
-                model="gemini-2.5-flash-preview-tts",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_modalities=["AUDIO"],
-                    speech_config=types.SpeechConfig(
-                        voice_config=types.VoiceConfig(
-                            prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                                voice_name=voice_name
-                            )
-                        )
-                    )
-                )
-            )
-        )
-
-        audio_data = response.candidates.content.parts.inline_data.data
-        return audio_data
-        
-    except Exception as e:
-        logger.error(f'Error in generate_tts_audio: {e}')
-        return None
-
-async def generate_video_with_veo(prompt: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Membuat video menggunakan Veo 3 dari prompt teks.
-    Mengembalikan path file video yang disimpan dan pesan error jika ada.
-    """
-    try:
-        operation = client.models.generate_videos(
-            model="veo-3.0-generate-preview",
-            prompt=prompt,
-        )
-        logger.info(f"Memulai pembuatan video untuk prompt: {prompt}")
-
-        loop = asyncio.get_event_loop()
-
-        while not operation.done:
-            await asyncio.sleep(10)
-            operation = await loop.run_in_executor(None, lambda: client.operations.get(operation))
-
-        logger.info("Pembuatan video selesai.")
-
-        if hasattr(operation, 'error') and operation.error:
-             error_message = f"Gagal membuat video. Detail: {operation.error.message}"
-             logger.error(error_message)
-             return None, error_message
-
-        if hasattr(operation, 'response') and operation.response and operation.response.generated_videos:
-            generated_video = operation.response.generated_videos
-            video_file_name = f"veo_{int(time.time())}.mp4"
-            
-            def save_video_sync():
-                client.files.download(file=generated_video.video)
-                generated_video.video.save(video_file_name)
-
-            await loop.run_in_executor(None, save_video_sync)
-            
-            logger.info(f"Video disimpan ke {video_file_name}")
-            return video_file_name, None
-        else:
-            return None, "Gagal membuat video: Tidak ada video yang dihasilkan dalam respons."
-
-    except Exception as e:
-        logger.error(f"Error di generate_video_with_veo: {e}")
-        return None, f"Terjadi kesalahan teknis saat membuat video: {e}"
-
-def save_temp_wav(audio_data: bytes) -> str:
-    temp_file = f"temp_{int(time.time())}.wav"
-    with wave.open(temp_file, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(24000)
-        wf.writeframes(audio_data)
-    return temp_file
-
 def split_text(text: str, max_length: int = 1900) -> List[str]:
     if len(text) <= max_length:
         return [text]
@@ -378,10 +282,8 @@ def check_cooldown(user_id: str, command: str) -> Tuple[bool, float]:
     if current_time < cooldown_end_time:
         remaining_time = cooldown_end_time - current_time
         return True, remaining_time
-    video_cooldown = 120
     normal_cooldown = 30
-    cooldown_duration = video_cooldown if command == "video" else normal_cooldown
-    bot_state.command_cooldowns[cooldown_key] = current_time + cooldown_duration
+    bot_state.command_cooldowns[cooldown_key] = current_time + normal_cooldown
     return False, 0
 
 class InteractionButtons(ui.View):
@@ -427,82 +329,6 @@ intents = Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-async def fetch_earthquake_data() -> Optional[Dict]:
-    try:
-        session = await get_http_session()
-        url = "https://data.bmkg.go.id/DataMKG/TEWS/autogempa.json"
-        async with session.get(url) as response:
-            if response.status != 200:
-                logger.error(f"Failed to fetch earthquake data: HTTP {response.status}")
-                return None
-            data = await response.json()
-        return data['Infogempa']['gempa']
-    except Exception as e:
-        logger.error(f"Error fetching earthquake data: {e}")
-        return None
-
-async def bmkg_alert_task():
-    while True:
-        for channel_id in list(bot_state.bmkg_alerts):
-            if bot_state.bmkg_alerts.get(channel_id, False):
-                channel = bot.get_channel(int(channel_id))
-                if not channel:
-                    continue
-                earthquake_data = await fetch_earthquake_data()
-                if earthquake_data:
-                    eq_id = earthquake_data.get('Infogempa', {}).get('gempa', {}).get('Dirasakan', '')
-                    last_eq_id = bot_state.last_earthquake_id.get(channel_id, '')
-                    if eq_id and eq_id != last_eq_id:
-                        embed = Embed(
-                            title="🌍 Peringatan Gempa Bumi Terkini",
-                            description="**Informasi gempa terbaru dari BMKG**",
-                            color=Color.red(),
-                            timestamp=datetime.now(timezone.utc)
-                        )
-                        embed.set_thumbnail(url="https://www.bmkg.go.id/asset/img/logo-bmkg.png")
-                        embed.add_field(
-                            name="📅 Tanggal & Waktu",
-                            value=f"{earthquake_data.get('Tanggal')} {earthquake_data.get('Jam')}",
-                            inline=False
-                        )
-                        embed.add_field(
-                            name="💪 Magnitudo",
-                            value=f"{earthquake_data.get('Magnitude')} SR",
-                            inline=True
-                        )
-                        embed.add_field(
-                            name="📏 Kedalaman",
-                            value=earthquake_data.get('Kedalaman'),
-                            inline=True
-                        )
-                        embed.add_field(
-                            name="📍 Lokasi",
-                            value=earthquake_data.get('Wilayah'),
-                            inline=False
-                        )
-                        embed.add_field(
-                            name="🌐 Koordinat",
-                            value=f"{earthquake_data.get('Lintang')}, {earthquake_data.get('Bujur')}",
-                            inline=True
-                        )
-                        tsunami_potential = earthquake_data.get('Potensi')
-                        tsunami_text = f"⚠️ {tsunami_potential}" if "Tsunami" in tsunami_potential else tsunami_potential
-                        embed.add_field(
-                            name="🌊 Potensi Tsunami",
-                            value=tsunami_text,
-                            inline=True
-                        )
-                        embed.set_footer(
-                            text="Sumber: Badan Meteorologi, Klimatologi, dan Geofisika",
-                            icon_url="https://www.bmkg.go.id/asset/img/logo-bmkg.png"
-                        )
-                        shakemap = earthquake_data.get('Shakemap', '')
-                        if shakemap:
-                            embed.set_image(url=f"https://data.bmkg.go.id/DataMKG/TEWS/{shakemap}")
-                        await channel.send(embed=embed)
-                        bot_state.last_earthquake_id[channel_id] = eq_id
-        await asyncio.sleep(EARTHQUAKE_CHECK_INTERVAL)
-
 @bot.event
 async def on_ready():
     logger.info(f'Bot {bot.user} siap!')
@@ -511,7 +337,6 @@ async def on_ready():
         logger.info(f"Synced {len(synced)} command(s)")
         bot.loop.create_task(periodic_cleanup())
         bot.loop.create_task(check_inactivity())
-        bot.loop.create_task(bmkg_alert_task())
     except Exception as e:
         logger.error(f"Failed to sync commands: {e}")
 
@@ -615,144 +440,6 @@ async def on_message(message):
             del bot_state.last_button_message[channel_id]
         except Exception as e:
             logger.error(f"Error deleting event {e}")
-
-    if content.lower() == '!bmkg_test':
-        on_cooldown, remaining_time = check_cooldown(user_id, "bmkg_test")
-        if on_cooldown:
-            await message.reply(
-                f"**Cooldown**\nSilakan tunggu {remaining_time:.1f} detik sebelum sebelum menggunakan perintah ini lagi.")
-            return
-        async with message.channel.typing():
-            earthquake_data = await fetch_earthquake_data()
-            if earthquake_data:
-                embed = Embed(
-                    title="🌍 Tes Peringatan Gempa Bumi",
-                    description="**Informasi gempa terbaru dari BMKG (Tes)**",
-                    color=Color.red(),
-                    timestamp=datetime.now(timezone.utc)
-                )
-                embed.set_thumbnail(url="https://www.bmkg.go.id/asset/img/logo-bmkg.png")
-                embed.add_field(
-                    name="📅 Tanggal & Waktu",
-                    value=f"{earthquake_data.get('Tanggal')} {earthquake_data.get('Jam')}",
-                    inline=False
-                )
-                embed.add_field(
-                    name="💪 Magnitudo",
-                    value=f"{earthquake_data.get('Magnitude')} SR",
-                    inline=True
-                )
-                embed.add_field(
-                    name="📏 Kedalaman",
-                    value=earthquake_data.get('Kedalaman'),
-                    inline=True
-                )
-                embed.add_field(
-                    name="📍 Lokasi",
-                    value=earthquake_data.get('Wilayah'),
-                    inline=False
-                )
-                embed.add_field(
-                    name="🌐 Koordinat",
-                    value=f"{earthquake_data.get('Lintang')}, {earthquake_data.get('Bujur')}",
-                    inline=True
-                )
-                tsunami_potential = earthquake_data.get('Potensi')
-                tsunami_text = f"⚠️ {tsunami_potential}" if "Tsunami" in tsunami_potential else tsunami_potential
-                embed.add_field(
-                    name="🌊 Potensi Tsunami",
-                    value=tsunami_text,
-                    inline=True
-                )
-                embed.set_footer(
-                    text="Sumber: Badan Meteorologi, Klimatologi, dan Geofisika",
-                    icon_url="https://www.bmkg.go.id/asset/img/logo-bmkg.png"
-                )
-                shakemap = earthquake_data.get('Shakemap', '')
-                if shakemap:
-                    embed.set_image(url=f"https://data.bmkg.go.id/DataMKG/TEWS/{shakemap}")
-                await message.channel.send(embed=embed)
-            else:
-                await message.channel.send("**Tes Gempa Bumi**\nGagal mengambil data gempa terbaru dari BMKG.")
-        return
-
-    if content.lower() == '!bmkg':
-        on_cooldown, remaining_time = check_cooldown(user_id, "bmkg")
-        if on_cooldown:
-            await message.reply(
-                f"**Cooldown**\nSilakan tunggu {remaining_time:.1f} detik sebelum menggunakan perintah ini lagi.")
-            return
-        bot_state.bmkg_alerts[channel_id] = not bot_state.bmkg_alerts.get(channel_id, False)
-        status = "diaktifkan" if bot_state.bmkg_alerts[channel_id] else "dinonaktifkan"
-        await message.reply(f"**Status**\nPeringatan gempa bumi telah {status} di channel ini!")
-        return
-
-    if content.lower().startswith('!suara'):
-        async with message.channel.typing():
-            tts_prompt = content.replace('!suara', '', 1).strip()
-            if not tts_prompt:
-                await message.reply('**Error**\nGunakan format: `!suara [teks untuk diucapkan]`')
-                return
-                
-            language = 'id-ID'
-            if tts_prompt.lower().startswith('en:'):
-                language = 'en-US'
-                tts_prompt = tts_prompt[3:].strip()
-            elif tts_prompt.lower().startswith('ja:'):
-                language = 'ja-JP'
-                tts_prompt = tts_prompt[3:].strip()
-                
-            audio_data = await generate_tts_audio(tts_prompt, language)
-            if audio_data is None:
-                await message.reply(f'**Error**\nGagal menghasilkan suara untuk bahasa {language}.')
-                return
-                
-            temp_file = save_temp_wav(audio_data)
-            
-            with open(temp_file, 'rb') as f:
-                audio_file = File(f, filename='output.wav')
-                await message.channel.send(file=audio_file)
-                
-            os.remove(temp_file)
-        return
-
-    if content.lower().startswith('!video'):
-        on_cooldown, remaining_time = check_cooldown(user_id, "video")
-        if on_cooldown:
-            await message.reply(
-                f"**Cooldown Video**\nPerintah ini memiliki cooldown lebih lama. Silakan tunggu {remaining_time:.1f} detik lagi.")
-            return
-
-        video_prompt = content.replace('!video', '', 1).strip()
-        if not video_prompt:
-            await message.reply('**Error**\nGunakan format: `!video [deskripsi adegan video]`')
-            return
-
-        await message.reply(f"⏳ **Membuat Video...**\nPrompt: `{video_prompt}`\nProses ini bisa memakan waktu beberapa menit. Harap bersabar!")
-
-        video_path, error = await generate_video_with_veo(video_prompt)
-
-        if error:
-            await message.channel.send(f"**Gagal Membuat Video**\nMaaf, terjadi kesalahan:\n`{error}`")
-            return
-        
-        if video_path:
-            try:
-                if os.path.getsize(video_path) > MAX_FILE_SIZE:
-                    await message.channel.send("**Error Ukuran File**\nVideo yang dihasilkan terlalu besar untuk diunggah ke Discord (di atas 25MB).")
-                else:
-                    with open(video_path, 'rb') as f:
-                        video_file = File(f, filename=os.path.basename(video_path))
-                        await message.channel.send(f"✅ **Video Selesai!**\nBerikut adalah video untuk prompt: `{video_prompt}`", file=video_file)
-            except Exception as e:
-                logger.error(f"Gagal memproses atau mengirim file video: {e}")
-                await message.channel.send("**Error**\nGagal memproses atau mengirim file video ke Discord.")
-            finally:
-                if os.path.exists(video_path):
-                    os.remove(video_path)
-        else:
-            await message.channel.send("**Error**\nTerjadi kesalahan yang tidak diketahui saat membuat video.")
-        return
         
     if content.lower() == '!reset':
         if channel_id in bot_state.conversation_history:
