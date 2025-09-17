@@ -6,3 +6,4 @@ Pillow
 requests
 sift-stack-py
 lxml
+PyNaCl
