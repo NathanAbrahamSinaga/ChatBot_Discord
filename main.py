@@ -527,14 +527,14 @@ async def suara(interaction: Interaction, text: str, bahasa: app_commands.Choice
     await interaction.response.defer()
     japanese_text = text
     if bahasa.value != "jp":
-        await interaction.edit_original_response(content=f"⏳ Menerjemahkan teks ke bahasa Jepang...")
+        await interaction.edit_original_response(content=f"⏳")
         japanese_text = await translate_to_japanese(text)
         if japanese_text == text:
             await interaction.edit_original_response(content=f"⚠️ Gagal menerjemahkan, menggunakan teks asli: '{text}'")
         else:
             await interaction.edit_original_response(content=f"✅ Terjemahan berhasil: '{japanese_text}'.\n🔊 Menghasilkan file suara...")
     else:
-        await interaction.edit_original_response(content=f"🔊 Menghasilkan file suara untuk: '{japanese_text}'")
+        await interaction.edit_original_response(content=f"⏳")
     try:
         session = await get_http_session()
         encoded_text = quote(japanese_text)
@@ -551,7 +551,7 @@ async def suara(interaction: Interaction, text: str, bahasa: app_commands.Choice
                 return
             audio_file = io.BytesIO(audio_data)
             file = File(fp=audio_file, filename="suara.mp3")
-            await interaction.edit_original_response(content=f"Berikut adalah file suaranya:", attachments=[file])
+            await interaction.edit_original_response(content=f"", attachments=[file])
     except Exception as e:
         logger.error(f"Error in /suara command: {e}", exc_info=True)
         await interaction.edit_original_response(content="❌ Terjadi kesalahan internal saat memproses permintaan suara.")
