@@ -7,3 +7,4 @@ requests
 sift-stack-py
 lxml
 PyNaCl
+google-genai

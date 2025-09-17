@@ -5,7 +5,7 @@ import io
 import time
 import logging
 from dotenv import load_dotenv
-from discord import Client, Intents, Interaction, app_commands, Attachment, ButtonStyle, ui, Embed, Color, File, FFmpegPCMAudio
+from discord import Client, Intents, Interaction, app_commands, Attachment, ButtonStyle, ui, Embed, Color, File
 from discord.ext import commands
 import google.genai as genai
 import google.genai.types as types
@@ -14,10 +14,10 @@ from bs4 import BeautifulSoup
 import aiohttp
 from typing import Optional, Dict, List, Tuple
 import re
-import json
-from datetime import datetime, timezone
+from datetime import datetime
 import lxml
 from collections import Counter, defaultdict
+from urllib.parse import quote
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -49,13 +49,11 @@ Jawab dengan bahasa Indonesia. Pastikan output rapi dan mudah dibaca di Discord 
 
 trend_analysis_prompt = """
 Analisis percakapan berikut dan berikan kesimpulan dalam format yang rapi untuk Discord:
-
 1. **Topik Utama yang Dibahas** - list 5-10 topik paling sering muncul
 2. **Jenis Pertanyaan Favorit** - kategori pertanyaan yang paling sering ditanya
 3. **Pola Interaksi** - waktu paling aktif, panjang percakapan rata-rata
 4. **Minat dan Preferensi** - tema yang paling menarik bagi user
 5. **Saran** - rekomendasi topik untuk eksplorasi lebih lanjut
-
 Gunakan emoji dan format markdown yang menarik. Maksimal 1500 karakter.
 """
 
@@ -81,13 +79,15 @@ class ConversationTracker:
         self.timestamps = defaultdict(list)
         self.question_types = defaultdict(Counter)
         self.user_interests = defaultdict(Counter)
+    
     def add_message(self, channel_id: str, user_id: str, content: str, timestamp: float):
-        message_data = { 'user_id': user_id, 'content': content, 'timestamp': timestamp, 'datetime': datetime.fromtimestamp(timestamp) }
+        message_data = {'user_id': user_id, 'content': content, 'timestamp': timestamp, 'datetime': datetime.fromtimestamp(timestamp)}
         self.messages[channel_id].append(message_data)
         self.timestamps[channel_id].append(timestamp)
         self._extract_topics(channel_id, content)
         self._classify_question_type(channel_id, content)
         self._extract_interests(channel_id, user_id, content)
+    
     def _extract_topics(self, channel_id: str, content: str):
         content_lower = content.lower()
         tech_keywords = ['python', 'javascript', 'coding', 'programming', 'ai', 'machine learning', 'discord', 'bot', 'api']
@@ -95,6 +95,7 @@ class ConversationTracker:
         general_keywords = ['cara', 'bagaimana', 'mengapa', 'apa itu', 'tutorial', 'belajar', 'help']
         entertainment_keywords = ['game', 'musik', 'film', 'anime', 'entertainment', 'fun', 'meme']
         business_keywords = ['bisnis', 'marketing', 'startup', 'investasi', 'uang', 'karir']
+        
         for keyword in tech_keywords:
             if keyword in content_lower: self.topics[channel_id]['Teknologi'] += 1
         for keyword in science_keywords:
@@ -105,6 +106,7 @@ class ConversationTracker:
             if keyword in content_lower: self.topics[channel_id]['Hiburan'] += 1
         for keyword in business_keywords:
             if keyword in content_lower: self.topics[channel_id]['Bisnis & Karir'] += 1
+    
     def _classify_question_type(self, channel_id: str, content: str):
         content_lower = content.lower()
         if any(word in content_lower for word in ['cara', 'bagaimana', 'how to']): self.question_types[channel_id]['Tutorial/Panduan'] += 1
@@ -112,10 +114,12 @@ class ConversationTracker:
         elif any(word in content_lower for word in ['mengapa', 'kenapa', 'why']): self.question_types[channel_id]['Analisis/Alasan'] += 1
         elif any(word in content_lower for word in ['help', 'tolong', 'bantuan', 'error']): self.question_types[channel_id]['Bantuan/Troubleshooting'] += 1
         elif any(word in content_lower for word in ['rekomendasikan', 'saran', 'recommend']): self.question_types[channel_id]['Rekomendasi'] += 1
+    
     def _extract_interests(self, channel_id: str, user_id: str, content: str):
         words = content.lower().split()
         for word in words:
             if len(word) > 3: self.user_interests[f"{channel_id}_{user_id}"][word] += 1
+    
     def get_trend_analysis(self, channel_id: str) -> str:
         if channel_id not in self.messages or not self.messages[channel_id]: return "📊 **Analisis Trend**\n\nBelum ada data percakapan untuk dianalisis."
         messages = self.messages[channel_id]
@@ -159,6 +163,7 @@ class BotState:
         self.last_activity: Dict[str, float] = {}
         self.last_button_message: Dict[str, any] = {}
         self.tracker = ConversationTracker()
+
     def cleanup_old_data(self):
         current_time = time.time()
         expired_cooldowns = [ key for key, timestamp in self.command_cooldowns.items() if current_time > timestamp ]
@@ -185,7 +190,7 @@ async def fetch_web_content(url: str) -> str:
         async with session.get(url, headers=headers) as response:
             if response.status != 200: return f"**Error Scraping**\nHTTP {response.status}: Gagal mengambil konten dari {url}."
             html = await response.text()
-        soup = BeautifulSoup(html, 'html.parser')
+        soup = BeautifulSoup(html, 'lxml')
         content = ""
         for elem in soup.select('p, h1, h2, h3, article, main'):
             text = elem.get_text().strip()
@@ -238,14 +243,25 @@ def extract_tenor_url(text: str) -> Optional[str]:
     match = re.search(tenor_pattern, text)
     return match.group(0) if match else None
 
-async def generate_response(channel_id: str, prompt: str, media_data: Optional[Dict] = None, search_query: Optional[str] = None, use_thinking: bool = False, youtube_url: Optional[str] = None, tenor_url: Optional[str] = None, urls: Optional[List[str]] = None) -> str:
+async def generate_response(channel_id: str, prompt: str, media_data: Optional[Dict] = None,
+                           search_query: Optional[str] = None, use_thinking: bool = False,
+                           youtube_url: Optional[str] = None, tenor_url: Optional[str] = None,
+                           urls: Optional[List[str]] = None) -> str:
     try:
-        model_name = "gemini-2.5-flash" if use_thinking else "gemini-2.5-pro"
+        model_name = "gemini-2.5-pro" if use_thinking else "gemini-2.5-flash"
         if channel_id not in bot_state.conversation_history:
             url_context_tool = Tool(url_context=types.UrlContext())
             tools = [url_context_tool]
-            if search_query: tools.append(Tool(google_search=types.GoogleSearch()))
-            bot_state.conversation_history[channel_id] = client.chats.create( model=model_name, config=types.GenerateContentConfig( system_instruction=system_prompt, temperature=0.9, max_output_tokens=4000, tools=tools))
+            if search_query:
+                tools.append(Tool(google_search=types.GoogleSearch()))
+            
+            bot_state.conversation_history[channel_id] = client.chats.create(
+                model=model_name,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    temperature=0.9,
+                    max_output_tokens=4000,
+                    tools=tools))
         chat = bot_state.conversation_history[channel_id]
         contents = [prompt]
         if search_query:
@@ -254,15 +270,24 @@ async def generate_response(channel_id: str, prompt: str, media_data: Optional[D
         if media_data:
             if media_data['mime_type'] == 'application/pdf':
                 pdf_buffer = base64.b64decode(media_data['base64'])
-                if len(pdf_buffer) > MAX_FILE_SIZE: return "**Error**\nFile PDF terlalu besar. Maksimal 25MB."
-                pdf_file = client.files.upload( file=io.BytesIO(pdf_buffer), config=dict(mime_type='application/pdf'))
+                if len(pdf_buffer) > MAX_FILE_SIZE:
+                    return "**Error**\nFile PDF terlalu besar. Maksimal 25MB."
+                pdf_file = client.files.upload(
+                    file=io.BytesIO(pdf_buffer),
+                    config=dict(mime_type='application/pdf'))
                 contents.append(pdf_file)
             else:
                 file_data = base64.b64decode(media_data['base64'])
-                if len(file_data) > MAX_FILE_SIZE: return "**Error**\nFile terlalu besar. Maksimal 25MB."
-                contents.append( types.Part.from_bytes( data=file_data, mime_type=media_data['mime_type']))
-        if youtube_url: contents.append( types.Part(file_data=types.FileData(file_uri=youtube_url)))
-        if tenor_url: contents.append(tenor_url)
+                if len(file_data) > MAX_FILE_SIZE:
+                    return "**Error**\nFile terlalu besar. Maksimal 25MB."
+                contents.append(
+                    types.Part.from_bytes(
+                        data=file_data, mime_type=media_data['mime_type']))
+        if youtube_url:
+            contents.append(
+                types.Part(file_data=types.FileData(file_uri=youtube_url)))
+        if tenor_url:
+            contents.append(tenor_url)
         if urls:
             for url in urls:
                 web_content = await fetch_web_content(url)
@@ -270,60 +295,52 @@ async def generate_response(channel_id: str, prompt: str, media_data: Optional[D
         loop = asyncio.get_event_loop()
         response = await loop.run_in_executor(None, lambda: chat.send_message(contents))
         response_text = response.text
-        if hasattr(response.candidates[0], 'url_context_metadata'):
-            url_metadata = response.candidates[0].url_context_metadata
-            if url_metadata and url_metadata.url_metadata:
-                response_text += "\n\n**Sumber URL yang Digunakan:**\n"
-                for meta in url_metadata.url_metadata:
-                    status = meta.url_retrieval_status
-                    status_text = "Berhasil" if status == types.UrlRetrievalStatus.URL_RETRIEVAL_STATUS_SUCCESS else "Gagal"
-                    response_text += f"- {meta.retrieved_url}: {status_text}\n"
         if not any(marker in response_text for marker in ['#', '-', '```']):
             paragraphs = [p.strip() for p in response_text.split('\n\n') if p.strip()]
             response_text = '\n\n' + '\n\n'.join(paragraphs)
         return response_text
-    except asyncio.TimeoutError: return "**Error**\nTimeout: Permintaan memakan waktu terlalu lama."
     except Exception as error:
-        logger.error(f'Error di generateResponse: {error}')
+        logger.error(f'Error di generateResponse: {error}', exc_info=True)
         return f"**Error**\nTerjadi kesalahan saat menghasilkan respons: {str(error)}"
 
 async def generate_trend_analysis(channel_id: str) -> str:
     try:
-        if channel_id not in bot_state.conversation_history: return "📊 **Analisis Trend**\n\nBelum ada riwayat percakapan untuk dianalisis."
-        messages_data = []
-        for message_data in bot_state.tracker.messages[channel_id]: messages_data.append(f"User: {message_data['content']}")
-        if len(messages_data) < 5: return bot_state.tracker.get_trend_analysis(channel_id)
+        if channel_id not in bot_state.tracker.messages[channel_id]:
+            return "📊 **Analisis Trend**\n\nBelum ada riwayat percakapan untuk dianalisis."
+        messages_data = [f"User: {msg['content']}" for msg in bot_state.tracker.messages[channel_id]]
+        if len(messages_data) < 5:
+            return bot_state.tracker.get_trend_analysis(channel_id)
         conversation_text = "\n".join(messages_data[-50:])
-        chat = client.chats.create( model="gemini-1.5-flash-latest", config=types.GenerateContentConfig( system_instruction=trend_analysis_prompt, temperature=0.7, max_output_tokens=2000))
+        chat = client.chats.create(
+            model="gemini-2.5-flash",
+            config=types.GenerateContentConfig(
+                system_instruction=trend_analysis_prompt,
+                temperature=0.7,
+                max_output_tokens=2000))
         loop = asyncio.get_event_loop()
         response = await loop.run_in_executor(None, lambda: chat.send_message([conversation_text]))
         basic_analysis = bot_state.tracker.get_trend_analysis(channel_id)
         ai_analysis = response.text
         return f"{basic_analysis}\n\n🤖 **Analisis AI:**\n{ai_analysis}"
     except Exception as error:
-        logger.error(f'Error generating trend analysis: {error}')
+        logger.error(f'Error generating trend analysis: {error}', exc_info=True)
         return bot_state.tracker.get_trend_analysis(channel_id)
 
 async def generate_trend_analysis_embed(channel_id: str) -> Embed:
     analysis_text = await generate_trend_analysis(channel_id)
-    embed = Embed( title="📊 Analisis Trend Percakapan", description=analysis_text, color=Color.blue(), timestamp=datetime.now() )
+    embed = Embed(title="📊 Analisis Trend Percakapan", description=analysis_text, color=Color.blue(), timestamp=datetime.now())
     embed.set_footer(text="Analisis diperbarui otomatis")
     return embed
 
 def split_text(text: str, max_length: int = 1900) -> List[str]:
     if len(text) <= max_length: return [text]
-    chunks = []
-    current_chunk = ''
+    chunks, current_chunk, in_code_block, current_language = [], '', False, ''
     lines = text.split('\n')
-    in_code_block = False
-    current_language = ''
     for line in lines:
         line_with_newline = line + '\n' if line != lines[-1] else line
         if line.strip().startswith('```'):
-            if not in_code_block:
-                current_language = line.strip().replace('```', '')
-                in_code_block = True
-            else: in_code_block = False
+            in_code_block = not in_code_block
+            if in_code_block: current_language = line.strip().replace('```', '')
             if len(current_chunk) + len(line_with_newline) > max_length:
                 if in_code_block: current_chunk += '\n```'
                 chunks.append(current_chunk.strip())
@@ -352,11 +369,20 @@ def check_cooldown(user_id: str, command: str) -> Tuple[bool, float]:
     current_time = time.time()
     cooldown_end_time = bot_state.command_cooldowns.get(cooldown_key, 0)
     if current_time < cooldown_end_time:
-        remaining_time = cooldown_end_time - current_time
-        return True, remaining_time
-    normal_cooldown = 30
-    bot_state.command_cooldowns[cooldown_key] = current_time + normal_cooldown
+        return True, cooldown_end_time - current_time
+    bot_state.command_cooldowns[cooldown_key] = current_time + 30
     return False, 0
+
+async def translate_to_japanese(text: str) -> str:
+    try:
+        chat = client.chats.create(model="gemini-2.5-flash", config=types.GenerateContentConfig(temperature=0.2))
+        loop = asyncio.get_event_loop()
+        prompt = f"Translate the following text to Japanese. Only return the translated text, nothing else: '{text}'"
+        response = await loop.run_in_executor(None, lambda: chat.send_message(prompt))
+        return response.text.strip()
+    except Exception as e:
+        logger.error(f"Error during translation: {e}")
+        return text
 
 class InteractionButtons(ui.View):
     def __init__(self, channel_id: str):
@@ -373,8 +399,9 @@ class InteractionButtons(ui.View):
                 await bot_state.last_button_message[channel_id].delete()
                 del bot_state.last_button_message[channel_id]
             except Exception as e: logger.error(f"Error deleting button message: {e}")
-        embed = Embed( description="✅ Percakapan baru telah dimulai! Kirim pesan untuk melanjutkan.", color=Color.green())
+        embed = Embed(description="✅ Percakapan baru telah dimulai! Kirim pesan untuk melanjutkan.", color=Color.green())
         await interaction.response.send_message(embed=embed)
+
     @ui.button(label="Continue", style=ButtonStyle.blurple, custom_id="continue_conversation")
     async def continue_button(self, interaction: Interaction, button: ui.Button):
         channel_id = str(interaction.channel_id)
@@ -385,7 +412,7 @@ class InteractionButtons(ui.View):
                 await bot_state.last_button_message[channel_id].delete()
                 del bot_state.last_button_message[channel_id]
             except Exception as e: logger.error(f"Error deleting button message: {e}")
-        embed = Embed( description="✅ Melanjutkan percakapan! Kirim pesan untuk melanjutkan.", color=Color.blurple())
+        embed = Embed(description="✅ Melanjutkan percakapan! Kirim pesan untuk melanjutkan.", color=Color.blurple())
         await interaction.response.send_message(embed=embed)
 
 intents = Intents.default()
@@ -413,7 +440,7 @@ async def check_inactivity():
                     if channel_id not in bot_state.last_button_message:
                         channel = bot.get_channel(int(channel_id))
                         if channel:
-                            embed = Embed( title="Bot Tidak Aktif", description="Bot telah tidak aktif selama 10 menit. Pilih opsi di bawah untuk melanjutkan:", color=Color.blue())
+                            embed = Embed(title="Bot Tidak Aktif", description="Bot telah tidak aktif selama 10 menit. Pilih opsi di bawah untuk melanjutkan:", color=Color.blue())
                             view = InteractionButtons(channel_id)
                             message = await channel.send(embed=embed, view=view)
                             bot_state.last_button_message[channel_id] = message
@@ -427,10 +454,11 @@ async def periodic_cleanup():
 
 @bot.tree.command(name="activate", description="Mengaktifkan bot di channel ini")
 async def activate(interaction: Interaction):
-    user_id = str(interaction.user.id)
-    channel_id = str(interaction.channel_id)
+    user_id, channel_id = str(interaction.user.id), str(interaction.channel_id)
     on_cooldown, remaining_time = check_cooldown(user_id, "activate")
-    if on_cooldown: await interaction.response.send_message( f"**Cooldown**\nSilakan tunggu {remaining_time:.1f} detik sebelum menggunakan perintah ini lagi.", ephemeral=True); return
+    if on_cooldown:
+        await interaction.response.send_message(f"**Cooldown**\nSilakan tunggu {remaining_time:.1f} detik.", ephemeral=True)
+        return
     bot_state.channel_activity[channel_id] = True
     bot_state.last_activity[channel_id] = time.time()
     if channel_id in bot_state.last_button_message:
@@ -442,10 +470,11 @@ async def activate(interaction: Interaction):
 
 @bot.tree.command(name="deactivate", description="Menonaktifkan bot di channel ini")
 async def deactivate(interaction: Interaction):
-    user_id = str(interaction.user.id)
-    channel_id = str(interaction.channel_id)
+    user_id, channel_id = str(interaction.user.id), str(interaction.channel_id)
     on_cooldown, remaining_time = check_cooldown(user_id, "deactivate")
-    if on_cooldown: await interaction.response.send_message( f"**Cooldown**\nSilakan tunggu {remaining_time:.1f} detik sebelum menggunakan perintah ini lagi.", ephemeral=True); return
+    if on_cooldown:
+        await interaction.response.send_message(f"**Cooldown**\nSilakan tunggu {remaining_time:.1f} detik.", ephemeral=True)
+        return
     bot_state.channel_activity[channel_id] = False
     if channel_id in bot_state.last_activity: del bot_state.last_activity[channel_id]
     if channel_id in bot_state.last_button_message:
@@ -473,54 +502,59 @@ class SpeakerTransformer(app_commands.Transformer):
         return choices[:25]
 
 class StyleTransformer(app_commands.Transformer):
-    async def transform(self, interaction: Interaction, value: str) -> int: return int(value)
-    async def autocomplete(self, interaction: Interaction, current: str) -> List[app_commands.Choice[int]]:
+    async def transform(self, interaction: Interaction, value: str) -> int:
+        return int(value)
+    async def autocomplete(self, interaction: Interaction, current: str) -> List[app_commands.Choice[str]]:
         speaker_uuid = interaction.namespace.karakter
-        if not speaker_uuid: return [app_commands.Choice(name="Pilih karakter dulu...", value=-1)]
+        if not speaker_uuid: return [app_commands.Choice(name="Pilih karakter dulu...", value="-1")]
         choices = []
         for speaker in PROCESSED_SPEAKERS:
             if speaker['uuid'] == speaker_uuid:
                 for style in speaker['styles']:
-                    if current.lower() in style['display_name'].lower(): choices.append(app_commands.Choice(name=style['display_name'], value=style['id']))
+                    if current.lower() in style['display_name'].lower():
+                        choices.append(app_commands.Choice(name=style['display_name'], value=str(style['id'])))
                 break
         return choices[:25]
 
-@bot.tree.command(name="suara", description="Mengirim pesan suara menggunakan VoiceVox.")
-@app_commands.describe( text="Teks yang akan diucapkan.", karakter="Pilih karakter suara.", gaya="Pilih gaya atau emosi suara." )
-async def suara( interaction: Interaction, text: str, karakter: app_commands.Transform[str, SpeakerTransformer], gaya: app_commands.Transform[int, StyleTransformer] ):
-    if not interaction.user.voice: await interaction.response.send_message("❌ Kamu harus berada di voice channel untuk menggunakan perintah ini.", ephemeral=True); return
-    await interaction.response.defer(ephemeral=True)
-    voice_channel = interaction.user.voice.channel
-    voice_client = interaction.guild.voice_client
-    if voice_client and voice_client.is_connected(): await voice_client.move_to(voice_channel)
+@bot.tree.command(name="suara", description="Membuat file suara MP3 dari teks menggunakan VoiceVox.")
+@app_commands.describe(text="Teks yang akan diucapkan.", bahasa="Bahasa dari teks yang dimasukkan.", karakter="Pilih karakter suara.", ekspresi="Pilih ekspresi suara.")
+@app_commands.choices(bahasa=[
+    app_commands.Choice(name="Indonesia", value="id"),
+    app_commands.Choice(name="Inggris", value="en"),
+    app_commands.Choice(name="Jepang", value="jp"),
+])
+async def suara(interaction: Interaction, text: str, bahasa: app_commands.Choice[str], karakter: app_commands.Transform[str, SpeakerTransformer], ekspresi: app_commands.Transform[int, StyleTransformer]):
+    await interaction.response.defer()
+    japanese_text = text
+    if bahasa.value != "jp":
+        await interaction.edit_original_response(content=f"⏳ Menerjemahkan teks ke bahasa Jepang...")
+        japanese_text = await translate_to_japanese(text)
+        if japanese_text == text:
+            await interaction.edit_original_response(content=f"⚠️ Gagal menerjemahkan, menggunakan teks asli: '{text}'")
+        else:
+            await interaction.edit_original_response(content=f"✅ Terjemahan berhasil: '{japanese_text}'.\n🔊 Menghasilkan file suara...")
     else:
-        try: voice_client = await voice_channel.connect()
-        except Exception as e:
-            logger.error(f"Error connecting to voice channel: {e}")
-            await interaction.followup.send("Gagal terhubung ke voice channel.", ephemeral=True)
-            return
+        await interaction.edit_original_response(content=f"🔊 Menghasilkan file suara untuk: '{japanese_text}'")
     try:
         session = await get_http_session()
-        api_url = f"https://voicevox.su-shiki.com/su-shikiapis/tts?text={text}&speaker={gaya}&key={VOICEVOX_API_KEY}"
+        encoded_text = quote(japanese_text)
+        api_url = f"https://deprecatedapis.tts.quest/v2/voicevox/audio?text={encoded_text}&speaker={ekspresi}&key={VOICEVOX_API_KEY}"
         async with session.get(api_url) as response:
             if response.status != 200:
                 error_text = await response.text()
                 logger.error(f"VoiceVox API Error {response.status}: {error_text}")
-                await interaction.followup.send(f"⚠️ Gagal menghasilkan suara. Error: {response.status}", ephemeral=True)
-                if voice_client.is_connected(): await voice_client.disconnect()
+                await interaction.edit_original_response(content=f"⚠️ Gagal menghasilkan suara. Error dari API: {response.status}")
                 return
             audio_data = await response.read()
-            audio_source = FFmpegPCMAudio(io.BytesIO(audio_data), pipe=True)
-            await interaction.followup.send("🔊 Memainkan suara...", ephemeral=True)
-            voice_client.play(audio_source, after=lambda e: logger.info(f'Finished playing: {e}'))
-            while voice_client.is_playing(): await asyncio.sleep(1)
+            if not audio_data:
+                await interaction.edit_original_response(content="❌ Gagal menghasilkan suara: API mengembalikan file kosong.")
+                return
+            audio_file = io.BytesIO(audio_data)
+            file = File(fp=audio_file, filename="suara.mp3")
+            await interaction.edit_original_response(content=f"Berikut adalah file suaranya:", attachments=[file])
     except Exception as e:
-        logger.error(f"Error in /suara command: {e}")
-        await interaction.followup.send("❌ Terjadi kesalahan saat memproses permintaan suara.", ephemeral=True)
-    finally:
-        if voice_client and not voice_client.is_playing() and voice_client.is_connected():
-            await asyncio.sleep(1)
-            await voice_client.disconnect()
+        logger.error(f"Error in /suara command: {e}", exc_info=True)
+        await interaction.edit_original_response(content="❌ Terjadi kesalahan internal saat memproses permintaan suara.")
 
 @bot.event
 async def on_message(message):
@@ -558,7 +592,9 @@ async def on_message(message):
     if content.lower().startswith('!think'):
         async with message.channel.typing():
             thinking_prompt = content.replace('!think', '', 1).strip()
-            if not thinking_prompt: await message.reply('**Error**\nGunakan format: `!think [pertanyaan atau permintaan]`'); return
+            if not thinking_prompt:
+                await message.reply('**Error**\nGunakan format: `!think [pertanyaan atau permintaan]`')
+                return
             attachment = message.attachments[0] if message.attachments else None
             media_data = None
             urls = extract_urls(thinking_prompt)
@@ -566,9 +602,12 @@ async def on_message(message):
                 mime_type = attachment.content_type
                 if mime_type not in SUPPORTED_MIME_TYPES:
                     supported_formats = ', '.join(set(SUPPORTED_MIME_TYPES.keys()))
-                    await message.reply(f'**Error**\nFormat file tidak didukung.\n**Format yang didukung:** {supported_formats}'); return
+                    await message.reply(f'**Error**\nFormat file tidak didukung.\n**Format yang didukung:** {supported_formats}')
+                    return
                 file_data = await download_attachment(attachment)
-                if file_data is None: await message.reply('**Error**\nGagal mengunduh file atau file terlalu besar (maksimal 25MB)!'); return
+                if file_data is None:
+                    await message.reply('**Error**\nGagal mengunduh file atau file terlalu besar (maksimal 25MB)!')
+                    return
                 base64_data = base64.b64encode(file_data).decode('utf-8')
                 media_data = {'mime_type': mime_type, 'base64': base64_data}
             try:
@@ -583,13 +622,12 @@ async def on_message(message):
         return
     if is_bot_active or content.startswith('!chat'):
         prompt = content
-        search_query = None
-        youtube_url = extract_youtube_url(content)
-        tenor_url = extract_tenor_url(content)
-        urls = extract_urls(content)
+        search_query, youtube_url, tenor_url, urls = None, extract_youtube_url(content), extract_tenor_url(content), extract_urls(content)
         if content.startswith('!chat'):
             chat_prompt = content.replace('!chat', '', 1).strip()
-            if not chat_prompt: await message.reply('**Error**\nGunakan format: `!chat [pertanyaan atau pesan]`'); return
+            if not chat_prompt:
+                await message.reply('**Error**\nGunakan format: `!chat [pertanyaan atau pesan]`')
+                return
             prompt = chat_prompt
         attachment = message.attachments[0] if message.attachments else None
         media_data = None
@@ -597,14 +635,17 @@ async def on_message(message):
             mime_type = attachment.content_type
             if mime_type not in SUPPORTED_MIME_TYPES:
                 supported_formats = ', '.join(set(SUPPORTED_MIME_TYPES.keys()))
-                await message.reply(f'**Error**\nFormat file tidak didukung.\n**Format yang didukung:** {supported_formats}'); return
+                await message.reply(f'**Error**\nFormat file tidak didukung.\n**Format yang didukung:** {supported_formats}')
+                return
             async with message.channel.typing():
                 file_data = await download_attachment(attachment)
-                if file_data is None: await message.reply('**Error**\nGagal mengunduh file atau file terlalu besar (maksimal 25MB)!'); return
+                if file_data is None:
+                    await message.reply('**Error**\nGagal mengunduh file atau file terlalu besar (maksimal 25MB)!')
+                    return
                 base64_data = base64.b64encode(file_data).decode('utf-8')
                 media_data = {'mime_type': mime_type, 'base64': base64_data}
                 try:
-                    ai_response = await generate_response( channel_id, prompt, media_data, search_query, False, youtube_url, tenor_url, urls)
+                    ai_response = await generate_response(channel_id, prompt, media_data, search_query, False, youtube_url, tenor_url, urls)
                     bot_state.tracker.add_message(channel_id, "bot", ai_response, current_time)
                     response_chunks = split_text(ai_response)
                     for i, chunk in enumerate(response_chunks):
@@ -616,7 +657,7 @@ async def on_message(message):
         else:
             async with message.channel.typing():
                 try:
-                    ai_response = await generate_response( channel_id, prompt, None, search_query, False, youtube_url, tenor_url, urls)
+                    ai_response = await generate_response(channel_id, prompt, None, search_query, False, youtube_url, tenor_url, urls)
                     bot_state.tracker.add_message(channel_id, "bot", ai_response, current_time)
                     response_chunks = split_text(ai_response)
                     for i, chunk in enumerate(response_chunks):
@@ -639,15 +680,21 @@ async def on_error(event, *args, **kwargs):
 
 @bot.event
 async def on_command_error(ctx, error):
-    if isinstance(error, commands.CommandOnCooldown): await ctx.send(f"⏰ Command sedang cooldown. Coba lagi dalam {error.retry_after:.1f} detik.")
-    elif isinstance(error, commands.MissingRequiredArgument): await ctx.send("❌ Argumen yang diperlukan tidak ditemukan. Periksa format command.")
+    if isinstance(error, commands.CommandOnCooldown):
+        await ctx.send(f"⏰ Command sedang cooldown. Coba lagi dalam {error.retry_after:.1f} detik.")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send("❌ Argumen yang diperlukan tidak ditemukan. Periksa format command.")
     else:
         logger.error(f'Command error: {error}', exc_info=True)
         await ctx.send("❌ Terjadi kesalahan saat menjalankan command.")
 
 if __name__ == "__main__":
-    try: bot.run(os.getenv('DISCORD_TOKEN'))
-    except KeyboardInterrupt: logger.info("Bot stopped by user")
-    except Exception as e: logger.error(f"Fatal error: {e}", exc_info=True)
+    try:
+        bot.run(os.getenv('DISCORD_TOKEN'))
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}", exc_info=True)
     finally:
-        if http_session and not http_session.closed: asyncio.run(http_session.close())
+        if http_session and not http_session.closed:
+            asyncio.run(http_session.close())
