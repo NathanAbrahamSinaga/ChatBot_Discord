@@ -4,6 +4,8 @@ import asyncio
 import io
 import time
 import logging
+import random
+from functools import wraps
 from dotenv import load_dotenv
 from discord import Client, Intents, Interaction, app_commands, Attachment, ButtonStyle, ui, Embed, Color, File
 from discord.ext import commands
@@ -21,6 +23,53 @@ from urllib.parse import quote
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ============ RATE LIMITING & RETRY LOGIC ============
+class RateLimiter:
+    """Global rate limiter to prevent Cloudflare bans"""
+    def __init__(self, max_requests: int = 30, time_window: int = 60):
+        self.max_requests = max_requests
+        self.time_window = time_window
+        self.requests = []
+        self.lock = asyncio.Lock()
+    
+    async def acquire(self):
+        """Wait until we can make a request"""
+        async with self.lock:
+            current_time = time.time()
+            # Remove old requests outside the time window
+            self.requests = [t for t in self.requests if current_time - t < self.time_window]
+            
+            if len(self.requests) >= self.max_requests:
+                # Wait until the oldest request expires
+                wait_time = self.time_window - (current_time - self.requests[0]) + 0.5
+                logger.warning(f"Rate limit reached, waiting {wait_time:.1f}s")
+                await asyncio.sleep(wait_time)
+                self.requests = [t for t in self.requests if time.time() - t < self.time_window]
+            
+            self.requests.append(time.time())
+
+# Global rate limiter instance (30 requests per 60 seconds)
+rate_limiter = RateLimiter(max_requests=30, time_window=60)
+
+async def retry_with_backoff(coro_func, max_retries=3, base_delay=5):
+    """Execute a coroutine with exponential backoff retry on rate limit errors"""
+    for attempt in range(max_retries):
+        try:
+            await rate_limiter.acquire()
+            return await coro_func()
+        except Exception as e:
+            error_str = str(e).lower()
+            is_rate_limit = any(x in error_str for x in ['429', 'rate limit', 'too many requests', '1015'])
+            
+            if is_rate_limit and attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt) + random.uniform(1, 5)
+                logger.warning(f"Rate limited, retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})")
+                await asyncio.sleep(delay)
+            else:
+                raise
+    return None
+# ============ END RATE LIMITING ============
 
 load_dotenv()
 
@@ -454,19 +503,31 @@ async def periodic_cleanup():
 
 @bot.tree.command(name="activate", description="Mengaktifkan bot di channel ini")
 async def activate(interaction: Interaction):
-    user_id, channel_id = str(interaction.user.id), str(interaction.channel_id)
-    on_cooldown, remaining_time = check_cooldown(user_id, "activate")
-    if on_cooldown:
-        await interaction.response.send_message(f"**Cooldown**\nSilakan tunggu {remaining_time:.1f} detik.", ephemeral=True)
-        return
-    bot_state.channel_activity[channel_id] = True
-    bot_state.last_activity[channel_id] = time.time()
-    if channel_id in bot_state.last_button_message:
-        try:
-            await bot_state.last_button_message[channel_id].delete()
-            del bot_state.last_button_message[channel_id]
-        except Exception as e: logger.error(f"Error deleting button message: {e}")
-    await interaction.response.send_message("**Status**\nBot diaktifkan di channel ini!")
+    try:
+        await rate_limiter.acquire()  # Rate limit check
+        user_id, channel_id = str(interaction.user.id), str(interaction.channel_id)
+        on_cooldown, remaining_time = check_cooldown(user_id, "activate")
+        if on_cooldown:
+            await interaction.response.send_message(f"**Cooldown**\nSilakan tunggu {remaining_time:.1f} detik.", ephemeral=True)
+            return
+        bot_state.channel_activity[channel_id] = True
+        bot_state.last_activity[channel_id] = time.time()
+        if channel_id in bot_state.last_button_message:
+            try:
+                await bot_state.last_button_message[channel_id].delete()
+                del bot_state.last_button_message[channel_id]
+            except Exception as e: logger.error(f"Error deleting button message: {e}")
+        await interaction.response.send_message("**Status**\nBot diaktifkan di channel ini!")
+    except Exception as e:
+        error_str = str(e).lower()
+        if any(x in error_str for x in ['429', 'rate limit', 'too many requests', '1015']):
+            logger.error(f"Rate limited in activate command: {e}")
+            try:
+                await interaction.response.send_message("⚠️ **Rate Limited**\nDiscord sedang membatasi request. Tunggu beberapa menit dan coba lagi.", ephemeral=True)
+            except:
+                pass
+        else:
+            raise
 
 @bot.tree.command(name="deactivate", description="Menonaktifkan bot di channel ini")
 async def deactivate(interaction: Interaction):
